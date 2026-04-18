@@ -7,7 +7,7 @@ APP_NAME = "ocr-test-rapidocr"
 OCR_CACHE_DIR = "/cache/rapidocr"
 CPU_THREADS = 2
 MAX_IMAGE_EDGE = 1800
-MIN_CONFIDENCE = 0.45
+MIN_CONFIDENCE = 0.40
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -47,7 +47,10 @@ def get_ocr():
 
     from rapidocr_onnxruntime import RapidOCR
 
-    _ocr = RapidOCR()
+    _ocr = RapidOCR(
+        det_db_box_thresh=0.3,
+        det_db_unclip_ratio=1.5,
+    )
     return _ocr
 
 
@@ -61,7 +64,7 @@ def extract_text(result):
     if not result:
         return ""
 
-    # Collect detections with spatial info
+    # Collect detections with full spatial info
     detections = []
     for item in result:
         if len(item) < 3:
@@ -73,37 +76,46 @@ def extract_text(result):
         xs = [pt[0] for pt in box]
         center_y = sum(ys) / len(ys)
         min_x = min(xs)
+        max_x = max(xs)
         height = max(ys) - min(ys)
-        detections.append((center_y, min_x, height, text))
+        width = max_x - min_x
+        detections.append({
+            "center_y": center_y,
+            "min_x": min_x,
+            "max_x": max_x,
+            "height": height,
+            "width": width,
+            "text": text,
+        })
 
     if not detections:
         return ""
 
     # Line grouping threshold: half the median text height
-    heights = sorted(d[2] for d in detections)
+    heights = sorted(d["height"] for d in detections)
     median_h = heights[len(heights) // 2] if heights else 20
     line_thresh = max(median_h * 0.5, 5)
 
     # Sort all detections top-to-bottom, then left-to-right
-    detections.sort(key=lambda d: (d[0], d[1]))
+    detections.sort(key=lambda d: (d["center_y"], d["min_x"]))
 
     # Group into lines by vertical proximity
     lines = []
     current_line = [detections[0]]
     for det in detections[1:]:
-        if abs(det[0] - current_line[0][0]) <= line_thresh:
+        if abs(det["center_y"] - current_line[0]["center_y"]) <= line_thresh:
             current_line.append(det)
         else:
             lines.append(current_line)
             current_line = [det]
     lines.append(current_line)
 
-    # Sort each line left-to-right and build output
+    # Build output with gap-based spacing
     output = []
     prev_center_y = None
     for line in lines:
-        line.sort(key=lambda d: d[1])
-        line_center_y = sum(d[0] for d in line) / len(line)
+        line.sort(key=lambda d: d["min_x"])
+        line_center_y = sum(d["center_y"] for d in line) / len(line)
 
         # Insert blank line for large vertical gaps (paragraph break)
         if prev_center_y is not None:
@@ -111,7 +123,24 @@ def extract_text(result):
             if gap > median_h * 1.8:
                 output.append("")
 
-        line_text = "  ".join(d[3] for d in line)
+        # Join words on this line using horizontal gap analysis
+        if len(line) == 1:
+            line_text = line[0]["text"]
+        else:
+            # Compute typical char width for this line
+            total_chars = sum(len(d["text"]) for d in line)
+            total_width = sum(d["width"] for d in line)
+            avg_char_w = total_width / max(total_chars, 1)
+
+            parts = [line[0]["text"]]
+            for i in range(1, len(line)):
+                gap = line[i]["min_x"] - line[i - 1]["max_x"]
+                # If gap is wider than ~0.3 of an average char, insert a space
+                if gap > avg_char_w * 0.3:
+                    parts.append(" ")
+                parts.append(line[i]["text"])
+            line_text = "".join(parts)
+
         output.append(line_text)
         prev_center_y = line_center_y
 
