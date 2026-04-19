@@ -1,0 +1,164 @@
+import importlib.util
+import sys
+import types
+from pathlib import Path
+
+
+class _FakeImageBuilder:
+    def apt_install(self, *args, **kwargs):
+        return self
+
+    def pip_install(self, *args, **kwargs):
+        return self
+
+    def env(self, *args, **kwargs):
+        return self
+
+
+class _FakeApp:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def function(self, *args, **kwargs):
+        def decorator(fn):
+            return fn
+
+        return decorator
+
+
+def _load_modal_app():
+    fake_modal = types.SimpleNamespace(
+        Image=types.SimpleNamespace(debian_slim=lambda **kwargs: _FakeImageBuilder()),
+        Volume=types.SimpleNamespace(from_name=lambda *args, **kwargs: object()),
+        App=lambda *args, **kwargs: _FakeApp(),
+        asgi_app=lambda **kwargs: (lambda fn: fn),
+    )
+    sys.modules["modal"] = fake_modal
+
+    spec = importlib.util.spec_from_file_location(
+        "modal_app_under_test", Path(__file__).with_name("modal_app.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+modal_app = _load_modal_app()
+
+
+def _box(left, top, right, bottom):
+    return [[left, top], [right, top], [right, bottom], [left, bottom]]
+
+
+def test_extract_text_drops_low_confidence_noise():
+    result = [
+        (_box(10, 10, 80, 30), "Broward", 0.96),
+        (_box(88, 10, 150, 30), "Health", 0.95),
+        (_box(12, 48, 200, 70), "Associate", 0.93),
+        (_box(210, 48, 225, 70), ".", 0.22),
+    ]
+
+    text = modal_app.extract_text(result)
+
+    assert text == "Broward Health\nAssociate"
+
+
+def test_extract_text_preserves_line_breaks_between_paragraphs():
+    result = [
+        (_box(10, 10, 70, 30), "Epic", 0.97),
+        (_box(80, 10, 140, 30), "Team", 0.97),
+        (_box(150, 10, 230, 30), "Staff", 0.96),
+        (_box(240, 10, 300, 30), "Levels", 0.96),
+        (_box(12, 90, 90, 112), "Associate", 0.94),
+    ]
+
+    text = modal_app.extract_text(result)
+
+    assert text == "Epic Team Staff Levels\n\nAssociate"
+
+
+def test_extract_text_does_not_chain_adjacent_lines_into_one_group():
+    result = [
+        (_box(10, 10, 70, 30), "Technical", 0.98),
+        (_box(80, 10, 170, 30), "Responsibilities", 0.98),
+        (_box(12, 36, 28, 56), "1.", 0.96),
+        (_box(40, 36, 160, 56), "Coding and Development", 0.96),
+        (_box(12, 60, 28, 80), "2.", 0.96),
+        (_box(40, 60, 140, 80), "System Support", 0.96),
+        (_box(12, 84, 28, 104), "3.", 0.96),
+        (_box(40, 84, 140, 104), "Documentation", 0.96),
+    ]
+
+    text = modal_app.extract_text(result)
+
+    assert text == (
+        "Technical Responsibilities\n"
+        "1. Coding and Development\n"
+        "2. System Support\n"
+        "3. Documentation"
+    )
+
+
+def test_extract_text_merges_wrapped_continuation_lines():
+    result = [
+        (_box(10, 10, 30, 30), "1.", 0.98),
+        (_box(40, 10, 190, 30), "Coding and Development:", 0.98),
+        (_box(200, 10, 320, 30), "Write, test,", 0.98),
+        (_box(40, 36, 260, 56), "and maintain code", 0.98),
+        (_box(40, 62, 280, 82), "for software applications.", 0.98),
+    ]
+
+    text = modal_app.extract_text(result)
+
+    assert text == (
+        "1. Coding and Development: Write, test,\n"
+        "and maintain code for software applications."
+    )
+
+
+def test_cleanup_extracted_text_repairs_common_document_noise():
+    raw_text = (
+        "Broward Health'\n"
+        "3. 'Debug issues methodically, often collaborating with senior team members.\n"
+        "user -reported problems\n"
+        "Problem -Solving Skills\n"
+        "_____"
+    )
+
+    text = modal_app.cleanup_extracted_text(raw_text)
+
+    assert text == (
+        "Broward Health\n"
+        "3. Debug issues methodically, often collaborating with senior team members.\n"
+        "user-reported problems\n"
+        "Problem-Solving Skills"
+    )
+
+
+def test_choose_best_ocr_candidate_prefers_more_complete_result():
+    short_result = [
+        (_box(10, 10, 80, 30), "Broward", 0.96),
+        (_box(88, 10, 150, 30), "Health", 0.95),
+        (_box(12, 48, 120, 70), "Associate", 0.94),
+    ]
+    full_result = short_result + [
+        (_box(10, 88, 180, 110), "Technical Responsibilities", 0.90),
+        (_box(12, 124, 140, 146), "System Support", 0.89),
+    ]
+
+    candidates = [
+        {
+            "name": "short",
+            "result": short_result,
+            "text": modal_app.extract_text(short_result),
+        },
+        {
+            "name": "full",
+            "result": full_result,
+            "text": modal_app.extract_text(full_result),
+        },
+    ]
+
+    best = modal_app.choose_best_ocr_candidate(candidates)
+
+    assert best["name"] == "full"
