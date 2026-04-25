@@ -110,9 +110,23 @@ def test_extract_text_merges_wrapped_continuation_lines():
 
     text = modal_app.extract_text(result)
 
+    assert text == "1. Coding and Development: Write, test, and maintain code for software applications."
+
+
+def test_extract_text_attaches_first_continuation_line_to_numbered_item():
+    result = [
+        (_box(10, 10, 30, 30), "1.", 0.98),
+        (_box(40, 10, 220, 30), "Coding and Development:", 0.98),
+        (_box(230, 10, 430, 30), "Write, test, and maintain", 0.98),
+        (_box(48, 38, 330, 58), "code for software applications", 0.98),
+        (_box(48, 66, 300, 86), "with moderate assistance.", 0.98),
+    ]
+
+    text = modal_app.extract_text(result)
+
     assert text == (
-        "1. Coding and Development: Write, test,\n"
-        "and maintain code for software applications."
+        "1. Coding and Development: Write, test, and maintain "
+        "code for software applications with moderate assistance."
     )
 
 
@@ -133,6 +147,20 @@ def test_cleanup_extracted_text_repairs_common_document_noise():
         "user-reported problems\n"
         "Problem-Solving Skills"
     )
+
+
+def test_score_ocr_candidate_penalizes_orphan_lowercase_lines():
+    cleaner_text = (
+        "Technical Responsibilities\n"
+        "1. Coding and Development: Write, test, and maintain code.\n"
+        "2. System Support: Help troubleshoot issues."
+    )
+    noisier_text = cleaner_text + "\nmanager."
+
+    clean_score = modal_app.score_ocr_candidate(cleaner_text, [(_box(0, 0, 10, 10), "x", 0.9)])
+    noisy_score = modal_app.score_ocr_candidate(noisier_text, [(_box(0, 0, 10, 10), "x", 0.9)])
+
+    assert clean_score > noisy_score
 
 
 def test_choose_best_ocr_candidate_prefers_more_complete_result():

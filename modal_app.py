@@ -280,6 +280,64 @@ def cleanup_extracted_text(text):
     return cleaned.strip()
 
 
+def _looks_like_heading(text):
+    if not text:
+        return False
+
+    stripped = text.strip()
+    if re.match(r"^\d+\.\s", stripped):
+        return False
+
+    lowered = stripped.lower()
+    heading_phrases = (
+        "technical responsibilities",
+        "analytical and problem-solving skills",
+        "collaboration and communication",
+        "epic team staff levels",
+        "expectations by staff level",
+        "effective june",
+    )
+    if any(phrase in lowered for phrase in heading_phrases):
+        return True
+
+    words = stripped.split()
+    if len(words) <= 8 and stripped[0].isupper():
+        capitalized_words = sum(1 for word in words if word[:1].isupper())
+        return capitalized_words >= max(len(words) - 1, 1)
+
+    return False
+
+
+def _should_append_continuation(previous_text, current_text, current_min_x, left_margin, median_h):
+    if not previous_text or not current_text:
+        return False
+
+    if _looks_like_heading(previous_text):
+        return False
+
+    stripped = current_text.strip()
+    if re.match(r"^\d+\.\s", stripped):
+        return False
+    if _looks_like_heading(stripped):
+        return False
+
+    continuation_markers = (
+        stripped[:1].islower()
+        or stripped.startswith(("(", "["))
+        or current_min_x > left_margin + median_h * 0.9
+    )
+    if not continuation_markers:
+        return False
+
+    previous_ends_like_open_clause = previous_text.rstrip().endswith(
+        (":", ",", ";", "(", "/", "with", "and", "or")
+    )
+    previous_is_numbered_item = bool(re.match(r"^\d+\.\s", previous_text.strip()))
+    previous_is_short_label = len(previous_text.split()) <= 3 and previous_text[:1].isupper()
+
+    return previous_ends_like_open_clause or previous_is_numbered_item or not previous_is_short_label
+
+
 def extract_text(result):
     if not result:
         return ""
@@ -395,21 +453,23 @@ def extract_text(result):
 
     left_margin = min((line["min_x"] for line in rendered_lines if line["text"]), default=0)
     merged_output = []
-    prev_line_was_continuation = False
     for line in rendered_lines:
         text = line["text"]
         if not text:
             merged_output.append("")
-            prev_line_was_continuation = False
             continue
 
-        starts_new_block = text[0].isupper() or text.startswith(tuple(str(i) + "." for i in range(10)))
-        is_continuation = not starts_new_block and line["min_x"] > left_margin + median_h * 1.2
-        if merged_output and is_continuation and prev_line_was_continuation:
+        previous_text = next((item for item in reversed(merged_output) if item), "")
+        if merged_output and _should_append_continuation(
+            previous_text,
+            text,
+            line["min_x"],
+            left_margin,
+            median_h,
+        ):
             merged_output[-1] = f"{merged_output[-1]} {text}".strip()
         else:
             merged_output.append(text)
-        prev_line_was_continuation = is_continuation
 
     return cleanup_extracted_text("\n".join(merged_output).strip())
 
@@ -426,12 +486,24 @@ def score_ocr_candidate(text, result):
     lines = [line for line in text.splitlines() if line.strip()]
     alnum_chars = sum(1 for ch in text if ch.isalnum())
     short_lines = sum(1 for line in lines if len(line) <= 2)
+    orphan_lowercase_lines = sum(
+        1
+        for line in lines
+        if line[:1].islower() and not re.match(r"^\d+\.\s", line)
+    )
+    dangling_lines = sum(
+        1
+        for line in lines
+        if len(line.split()) <= 2 and line[:1].islower()
+    )
 
     return (
         (sum(confidences) / max(len(confidences), 1)) * 4.0
         + min(alnum_chars, 800) * 0.025
         + len(lines) * 0.2
         - short_lines * 0.25
+        - orphan_lowercase_lines * 0.6
+        - dangling_lines * 0.8
     )
 
 
