@@ -50,6 +50,15 @@ def _box(left, top, right, bottom):
     return [[left, top], [right, top], [right, bottom], [left, bottom]]
 
 
+class _FakeImage:
+    def __init__(self, width, height):
+        self.size = (width, height)
+
+    def crop(self, box):
+        left, top, right, bottom = box
+        return _FakeImage(right - left, bottom - top)
+
+
 def test_extract_text_drops_low_confidence_noise():
     result = [
         (_box(10, 10, 80, 30), "Broward", 0.96),
@@ -149,6 +158,27 @@ def test_cleanup_extracted_text_repairs_common_document_noise():
     )
 
 
+def test_cleanup_extracted_text_drops_numeric_garbage_and_splits_numbered_items():
+    raw_text = (
+        "43.11509\n"
+        "2.System Support: Help troubleshoot issues. 3. Documentation: Create and update docs."
+    )
+
+    text = modal_app.cleanup_extracted_text(raw_text)
+
+    assert text == (
+        "2. System Support: Help troubleshoot issues.\n"
+        "3. Documentation: Create and update docs."
+    )
+
+
+def test_lines_look_duplicated_detects_near_duplicate_lines():
+    left = "System Support: Help troubleshoot and resolve technical issues."
+    right = "2. System Support: Help troubleshoot and resolve technical issues."
+
+    assert modal_app.lines_look_duplicated(left, right)
+
+
 def test_score_ocr_candidate_penalizes_orphan_lowercase_lines():
     cleaner_text = (
         "Technical Responsibilities\n"
@@ -156,6 +186,25 @@ def test_score_ocr_candidate_penalizes_orphan_lowercase_lines():
         "2. System Support: Help troubleshoot issues."
     )
     noisier_text = cleaner_text + "\nmanager."
+
+    clean_score = modal_app.score_ocr_candidate(cleaner_text, [(_box(0, 0, 10, 10), "x", 0.9)])
+    noisy_score = modal_app.score_ocr_candidate(noisier_text, [(_box(0, 0, 10, 10), "x", 0.9)])
+
+    assert clean_score > noisy_score
+
+
+def test_score_ocr_candidate_penalizes_duplicate_and_numeric_noise():
+    cleaner_text = (
+        "Effective June 5, 2025\n"
+        "Technical Responsibilities\n"
+        "2. System Support: Help troubleshoot issues."
+    )
+    noisier_text = (
+        "Effective June 5, 2025\n"
+        "43.11509\n"
+        "2. System Support: Help troubleshoot issues.\n"
+        "2. System Support: Help troubleshoot issues."
+    )
 
     clean_score = modal_app.score_ocr_candidate(cleaner_text, [(_box(0, 0, 10, 10), "x", 0.9)])
     noisy_score = modal_app.score_ocr_candidate(noisier_text, [(_box(0, 0, 10, 10), "x", 0.9)])
@@ -190,3 +239,32 @@ def test_choose_best_ocr_candidate_prefers_more_complete_result():
     best = modal_app.choose_best_ocr_candidate(candidates)
 
     assert best["name"] == "full"
+
+
+def test_build_tiled_ocr_inputs_for_tall_pages():
+    image = _FakeImage(1200, 2400)
+
+    tiled = modal_app.build_tiled_ocr_inputs(image, "grayscale")
+
+    assert len(tiled) >= 2
+    assert tiled[0]["offset_y"] == 0
+    assert tiled[-1]["offset_y"] < 2400
+    assert all(item["group"] == "grayscale_tiles" for item in tiled)
+
+
+def test_parse_tesseract_data_converts_word_boxes():
+    data = {
+        "text": ["Broward", "", "Health"],
+        "conf": ["96", "-1", "93"],
+        "left": [10, 0, 90],
+        "top": [12, 0, 12],
+        "width": [70, 0, 60],
+        "height": [20, 0, 20],
+    }
+
+    result = modal_app.parse_tesseract_data(data)
+
+    assert result == [
+        (_box(10, 12, 80, 32), "Broward", 0.96),
+        (_box(90, 12, 150, 32), "Health", 0.93),
+    ]

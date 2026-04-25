@@ -3,8 +3,7 @@ import re
 import modal
 
 
-APP_NAME = "ocr-test-rapidocr"
-OCR_CACHE_DIR = "/cache/rapidocr"
+APP_NAME = "ocr-test-tesseract"
 CPU_THREADS = 2
 MAX_IMAGE_EDGE = 1800
 TARGET_MIN_IMAGE_EDGE = 1400
@@ -12,55 +11,36 @@ MAX_UPSCALE_FACTOR = 2.0
 MIN_CONFIDENCE = 0.40
 SHORT_TEXT_MIN_CONFIDENCE = 0.55
 MAX_SKEW_CORRECTION_DEGREES = 4.0
+TILE_OVERLAP_RATIO = 0.18
+MIN_TILE_HEIGHT = 900
+TESSERACT_PSM = 6
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install(
         "libgl1",
         "libglib2.0-0",
+        "tesseract-ocr",
     )
     .pip_install(
         "fastapi==0.115.12",
         "gradio==6.9.0",
         "numpy",
-        "onnxruntime==1.20.1",
         "opencv-python-headless==4.10.0.84",
         "Pillow",
-        "rapidocr-onnxruntime==1.4.4",
+        "pytesseract",
         "wordninja",
     )
     .env(
         {
             "OMP_NUM_THREADS": str(CPU_THREADS),
             "MKL_NUM_THREADS": str(CPU_THREADS),
-            "ORT_NUM_THREADS": str(CPU_THREADS),
-            "RAPIDOCR_MODEL_DIR": OCR_CACHE_DIR,
             "GRADIO_TEMP_DIR": "/tmp/gradio",
         }
     )
 )
 
-ocr_cache = modal.Volume.from_name("ocr-test-rapidocr-cache", create_if_missing=True)
 app = modal.App(APP_NAME)
-
-_ocr = None
-
-
-def get_ocr():
-    global _ocr
-    if _ocr is not None:
-        return _ocr
-
-    from rapidocr_onnxruntime import RapidOCR
-
-    _ocr = RapidOCR(
-        det_limit_side_len=1280,
-        det_db_thresh=0.2,
-        det_db_box_thresh=0.1,
-        det_db_unclip_ratio=1.6,
-        det_use_dilation=True,
-    )
-    return _ocr
 
 
 def resize_image_for_ocr(image):
@@ -161,8 +141,12 @@ def build_ocr_variants(image):
     if skew_angle:
         base = rotate_array(base, skew_angle, border_value=255)
 
+    background = cv2.GaussianBlur(base, (0, 0), 31)
+    normalized = cv2.divide(base, background, scale=255)
+    normalized = cv2.normalize(normalized, None, 0, 255, cv2.NORM_MINMAX)
+
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    contrast = clahe.apply(base)
+    contrast = clahe.apply(normalized)
     softened = cv2.GaussianBlur(contrast, (0, 0), 1.1)
     sharpened = cv2.addWeighted(contrast, 1.5, softened, -0.5, 0)
 
@@ -187,6 +171,10 @@ def build_ocr_variants(image):
             "image": Image.fromarray(cv2.cvtColor(sharpened, cv2.COLOR_GRAY2RGB)),
         },
         {
+            "name": "shadow_reduced",
+            "image": Image.fromarray(cv2.cvtColor(normalized, cv2.COLOR_GRAY2RGB)),
+        },
+        {
             "name": "adaptive",
             "image": Image.fromarray(cv2.cvtColor(adaptive, cv2.COLOR_GRAY2RGB)),
         },
@@ -199,6 +187,175 @@ def build_ocr_variants(image):
 
 def normalize_image(image):
     return build_ocr_variants(image)[0]["image"]
+
+
+def build_ocr_inputs(image):
+    variants = build_ocr_variants(image)
+    inputs = []
+    for variant in variants:
+        inputs.append(
+            {
+                "name": variant["name"],
+                "image": variant["image"],
+                "offset_x": 0,
+                "offset_y": 0,
+                "group": variant["name"],
+            }
+        )
+        inputs.extend(build_tiled_ocr_inputs(variant["image"], variant["name"]))
+    return inputs
+
+
+def build_tiled_ocr_inputs(image, base_name):
+    width, height = image.size
+    if height < max(width * 1.2, MIN_TILE_HEIGHT * 1.2):
+        return []
+
+    tile_count = 3 if height >= width * 1.35 else 2
+    tile_height = max(int(round(height / tile_count)), MIN_TILE_HEIGHT)
+    tile_height = min(tile_height, height)
+    overlap = int(round(tile_height * TILE_OVERLAP_RATIO))
+    step = max(tile_height - overlap, 1)
+
+    inputs = []
+    top = 0
+    tile_index = 0
+    while top < height:
+        bottom = min(top + tile_height, height)
+        crop = image.crop((0, top, width, bottom))
+        inputs.append(
+            {
+                "name": f"{base_name}_tile_{tile_index + 1}",
+                "image": crop,
+                "offset_x": 0,
+                "offset_y": top,
+                "group": f"{base_name}_tiles",
+            }
+        )
+        if bottom >= height:
+            break
+        top += step
+        tile_index += 1
+    return inputs
+
+
+def offset_box(box, offset_x=0, offset_y=0):
+    return [[pt[0] + offset_x, pt[1] + offset_y] for pt in box]
+
+
+def offset_ocr_result(result, offset_x=0, offset_y=0):
+    adjusted = []
+    for item in result or []:
+        if len(item) < 3:
+            continue
+        box, text, score = item[0], item[1], item[2]
+        adjusted.append((offset_box(box, offset_x, offset_y), text, score))
+    return adjusted
+
+
+def _box_bounds(box):
+    xs = [pt[0] for pt in box]
+    ys = [pt[1] for pt in box]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _intersection_over_union(box_a, box_b):
+    ax1, ay1, ax2, ay2 = _box_bounds(box_a)
+    bx1, by1, bx2, by2 = _box_bounds(box_b)
+
+    inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+    inter_h = max(0, min(ay2, by2) - max(ay1, by1))
+    intersection = inter_w * inter_h
+    if intersection <= 0:
+        return 0.0
+
+    area_a = max(ax2 - ax1, 0) * max(ay2 - ay1, 0)
+    area_b = max(bx2 - bx1, 0) * max(by2 - by1, 0)
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def dedupe_ocr_results(result):
+    deduped = []
+    for item in sorted(
+        result or [],
+        key=lambda entry: (-(entry[2] or 0), entry[0][0][1], entry[0][0][0]),
+    ):
+        if len(item) < 3:
+            continue
+        box, raw_text, score = item[0], (item[1] or "").strip(), item[2]
+        if not raw_text:
+            continue
+        normalized_text = re.sub(r"\s+", " ", raw_text).strip().lower()
+        duplicate_found = False
+        for kept in deduped:
+            kept_text = re.sub(r"\s+", " ", (kept[1] or "").strip()).lower()
+            if normalized_text != kept_text:
+                continue
+            if _intersection_over_union(box, kept[0]) >= 0.5:
+                duplicate_found = True
+                break
+        if not duplicate_found:
+            deduped.append((box, raw_text, score))
+    return deduped
+
+
+def parse_tesseract_data(data):
+    result = []
+    count = len(data.get("text", []))
+    for i in range(count):
+        raw_text = (data["text"][i] or "").strip()
+        if not raw_text:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            continue
+        if conf < 0:
+            continue
+        left = int(data["left"][i])
+        top = int(data["top"][i])
+        width = int(data["width"][i])
+        height = int(data["height"][i])
+        result.append(
+            (
+                [[left, top], [left + width, top], [left + width, top + height], [left, top + height]],
+                raw_text,
+                max(min(conf / 100.0, 1.0), 0.0),
+            )
+        )
+    return result
+
+
+def run_tesseract(image):
+    import pytesseract
+
+    data = pytesseract.image_to_data(
+        image,
+        output_type=pytesseract.Output.DICT,
+        config=f"--oem 3 --psm {TESSERACT_PSM} -c preserve_interword_spaces=1",
+    )
+    return parse_tesseract_data(data)
+
+
+def group_ocr_candidates(raw_candidates):
+    grouped = {}
+    for candidate in raw_candidates:
+        group_name = candidate["group"]
+        grouped.setdefault(group_name, []).extend(candidate["result"])
+
+    candidates = []
+    for group_name, result in grouped.items():
+        deduped_result = dedupe_ocr_results(result)
+        candidates.append(
+            {
+                "name": group_name,
+                "group": group_name,
+                "result": deduped_result,
+                "text": extract_text(deduped_result),
+            }
+        )
+    return candidates
 
 
 def fix_word_spacing(text):
@@ -276,8 +433,58 @@ def cleanup_extracted_text(text):
         cleaned_lines.append(line)
 
     cleaned = "\n".join(cleaned_lines)
+    cleaned = re.sub(r"(?<=\d)\.(?=[A-Z])", ". ", cleaned)
+    cleaned = re.sub(r"(?<!\n)(?=(?:\d{1,2}\.)\s*[A-Z])", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    normalized_lines = []
+    for raw_line in cleaned.splitlines():
+        if not raw_line.strip():
+            if normalized_lines and normalized_lines[-1] != "":
+                normalized_lines.append("")
+            continue
+        for line in split_inline_numbered_items(raw_line):
+            if is_suspicious_numeric_line(line):
+                continue
+            if normalized_lines and lines_look_duplicated(normalized_lines[-1], line):
+                continue
+            normalized_lines.append(line)
+    cleaned = "\n".join(normalized_lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def split_inline_numbered_items(line):
+    parts = re.split(r"(?=(?:^|\s)(?:\d{1,2}\.)\s*[A-Z])", line)
+    return [part.strip() for part in parts if part and part.strip()]
+
+
+def is_suspicious_numeric_line(text):
+    stripped = text.strip()
+    return bool(re.fullmatch(r"\d{2,}\.\d{4,}", stripped))
+
+
+def _normalize_compare_text(text):
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def lines_look_duplicated(left, right):
+    normalized_left = _normalize_compare_text(left)
+    normalized_right = _normalize_compare_text(right)
+    if not normalized_left or not normalized_right:
+        return False
+    if normalized_left == normalized_right:
+        return True
+    if len(normalized_left) >= 24 and normalized_left in normalized_right:
+        return True
+    if len(normalized_right) >= 24 and normalized_right in normalized_left:
+        return True
+
+    left_tokens = set(normalized_left.split())
+    right_tokens = set(normalized_right.split())
+    if not left_tokens or not right_tokens:
+        return False
+    overlap = len(left_tokens & right_tokens) / max(min(len(left_tokens), len(right_tokens)), 1)
+    return overlap >= 0.85 and min(len(left_tokens), len(right_tokens)) >= 5
 
 
 def _looks_like_heading(text):
@@ -496,6 +703,12 @@ def score_ocr_candidate(text, result):
         for line in lines
         if len(line.split()) <= 2 and line[:1].islower()
     )
+    suspicious_numeric_lines = sum(1 for line in lines if is_suspicious_numeric_line(line))
+    duplicate_lines = sum(
+        1
+        for i in range(1, len(lines))
+        if lines_look_duplicated(lines[i - 1], lines[i])
+    )
 
     return (
         (sum(confidences) / max(len(confidences), 1)) * 4.0
@@ -504,6 +717,8 @@ def score_ocr_candidate(text, result):
         - short_lines * 0.25
         - orphan_lowercase_lines * 0.6
         - dangling_lines * 0.8
+        - suspicious_numeric_lines * 1.5
+        - duplicate_lines * 1.0
     )
 
 
@@ -522,7 +737,6 @@ def choose_best_ocr_candidate(candidates):
 
 @app.function(
     image=image,
-    volumes={OCR_CACHE_DIR: ocr_cache},
     cpu=2,
     memory=3072,
     max_containers=1,
@@ -531,29 +745,30 @@ def choose_best_ocr_candidate(candidates):
 @modal.asgi_app(label="ocr")
 def ui():
     import gradio as gr
-    import numpy as np
     from fastapi import FastAPI
     from gradio.routes import mount_gradio_app
 
     web_app = FastAPI()
-    get_ocr()
 
     def process_document(image):
         if image is None:
             return "Please upload an image."
 
-        ocr = get_ocr()
-        candidates = []
-        for variant in build_ocr_variants(image):
-            result, _ = ocr(np.array(variant["image"]))
-            candidates.append(
+        raw_candidates = []
+        for ocr_input in build_ocr_inputs(image):
+            raw_candidates.append(
                 {
-                    "name": variant["name"],
-                    "result": result or [],
-                    "text": extract_text(result),
+                    "name": f"tesseract:{ocr_input['name']}",
+                    "group": f"tesseract:{ocr_input['group']}",
+                    "result": offset_ocr_result(
+                        run_tesseract(ocr_input["image"]),
+                        offset_x=ocr_input["offset_x"],
+                        offset_y=ocr_input["offset_y"],
+                    ),
                 }
             )
 
+        candidates = group_ocr_candidates(raw_candidates)
         best_candidate = choose_best_ocr_candidate(candidates)
         return best_candidate["text"] if best_candidate and best_candidate["text"] else "No text detected."
 
@@ -561,8 +776,8 @@ def ui():
         fn=process_document,
         inputs=gr.Image(type="pil", label="Upload scanned page / receipt / document"),
         outputs=gr.Textbox(label="Extracted text", lines=24),
-        title="Fast Document OCR - RapidOCR",
-        description="CPU-friendly OCR for standard scanned documents on Modal. Tuned for text, numbers, receipts, and printed pages.",
+        title="Fast Document OCR - Tesseract",
+        description="Document-focused OCR for scanned pages and phone photos on Modal. Tuned for policy pages, forms, and printed documents.",
     )
     blocks.enable_queue = False
 
