@@ -1,12 +1,9 @@
-import base64
-import io
-import os
 import re
 
 import modal
 
 
-APP_NAME = "ocr-test-rapidocr"
+APP_NAME = "ocr-test-surya"
 CPU_THREADS = 2
 MAX_IMAGE_EDGE = 1800
 TARGET_MIN_IMAGE_EDGE = 1400
@@ -17,7 +14,6 @@ MAX_SKEW_CORRECTION_DEGREES = 4.0
 TILE_OVERLAP_RATIO = 0.18
 MIN_TILE_HEIGHT = 900
 TESSERACT_PSMS = (3, 4, 6)
-OPENAI_VISION_MODEL = "gpt-4.1-mini"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -31,9 +27,10 @@ image = (
         "gradio==6.9.0",
         "numpy",
         "opencv-python-headless==4.10.0.84",
-        "openai",
         "Pillow",
         "pytesseract",
+        "surya-ocr",
+        "torch==2.7.1",
         "wordninja",
     )
     .env(
@@ -46,6 +43,7 @@ image = (
 )
 
 app = modal.App(APP_NAME)
+_surya_predictors = None
 
 
 def resize_image_for_ocr(image):
@@ -194,58 +192,82 @@ def normalize_image(image):
     return build_ocr_variants(image)[0]["image"]
 
 
-def pil_image_to_data_url(image, format="PNG"):
-    buffer = io.BytesIO()
-    image.save(buffer, format=format)
-    mime_type = "image/png" if format.upper() == "PNG" else "image/jpeg"
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
+def get_surya_predictors():
+    global _surya_predictors
+    if _surya_predictors is not None:
+        return _surya_predictors
+
+    from surya.foundation import FoundationPredictor
+    from surya.recognition import RecognitionPredictor
+    from surya.detection import DetectionPredictor
+
+    foundation_predictor = FoundationPredictor()
+    recognition_predictor = RecognitionPredictor(foundation_predictor)
+    detection_predictor = DetectionPredictor()
+    _surya_predictors = (recognition_predictor, detection_predictor)
+    return _surya_predictors
 
 
-def get_openai_api_key(explicit_key=""):
-    return (explicit_key or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+def _box_to_polygon(box):
+    if not box or len(box) != 4:
+        return None
+    x1, y1, x2, y2 = box
+    return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
 
 
-def run_openai_vision_text(image, api_key):
-    from openai import OpenAI
+def surya_line_to_result(line):
+    text = getattr(line, "text", None)
+    confidence = getattr(line, "confidence", None)
+    polygon = getattr(line, "polygon", None)
+    bbox = getattr(line, "bbox", None)
+    if isinstance(line, dict):
+        text = line.get("text", text)
+        confidence = line.get("confidence", confidence)
+        polygon = line.get("polygon", polygon)
+        bbox = line.get("bbox", bbox)
 
-    variants = {variant["name"]: variant["image"] for variant in build_ocr_variants(image)}
-    original = resize_image_for_ocr(image)
-    normalized = variants.get("shadow_reduced") or variants.get("grayscale") or original
+    if not text:
+        return None
+    if polygon is None:
+        polygon = _box_to_polygon(bbox)
+    if polygon is None:
+        return None
+    score = float(confidence) if confidence is not None else 0.9
+    return (polygon, text, score)
 
-    client = OpenAI(api_key=api_key)
-    response = client.responses.create(
-        model=OPENAI_VISION_MODEL,
-        max_output_tokens=3000,
-        input=[
+
+def parse_surya_predictions(predictions):
+    parsed = []
+    for prediction in predictions or []:
+        text_lines = getattr(prediction, "text_lines", None)
+        if isinstance(prediction, dict):
+            text_lines = prediction.get("text_lines", text_lines)
+        for line in text_lines or []:
+            item = surya_line_to_result(line)
+            if item is not None:
+                parsed.append(item)
+    return parsed
+
+
+def build_surya_candidates(image):
+    recognition_predictor, detection_predictor = get_surya_predictors()
+    variants = [
+        variant for variant in build_ocr_variants(image)
+        if variant["name"] in {"shadow_reduced", "grayscale"}
+    ]
+    candidates = []
+    for variant in variants:
+        predictions = recognition_predictor([variant["image"]], det_predictor=detection_predictor)
+        result = parse_surya_predictions(predictions)
+        candidates.append(
             {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "Transcribe this photographed printed document to plain text. "
-                            "Preserve headings, paragraph breaks, and numbered items. "
-                            "Fix obvious line-wrap splits and broken words when the intended text is clear. "
-                            "Do not add commentary. Omit visual artifacts, shadows, staples, page edges, coordinates, "
-                            "or gibberish that is not document text."
-                        ),
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": pil_image_to_data_url(original, format="JPEG"),
-                        "detail": "high",
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": pil_image_to_data_url(normalized, format="PNG"),
-                        "detail": "high",
-                    },
-                ],
+                "name": f"surya:{variant['name']}",
+                "group": f"surya:{variant['name']}",
+                "result": result,
+                "text": extract_text(result),
             }
-        ],
-    )
-    return cleanup_extracted_text(getattr(response, "output_text", "") or "")
+        )
+    return candidates
 
 
 def build_ocr_inputs(image):
@@ -845,15 +867,15 @@ def ui():
 
     web_app = FastAPI()
 
-    def process_document(image, engine, api_key):
+    def process_document(image, engine):
         if image is None:
             return "Please upload an image."
 
-        resolved_api_key = get_openai_api_key(api_key)
-        if engine == "OpenAI Vision" and resolved_api_key:
-            text = run_openai_vision_text(image, resolved_api_key)
-            if text:
-                return text
+        if engine == "Surya":
+            candidates = build_surya_candidates(image)
+            best_candidate = choose_best_ocr_candidate(candidates)
+            if best_candidate and best_candidate["text"]:
+                return best_candidate["text"]
 
         text_candidates = build_tesseract_text_candidates(image)
         raw_candidates = []
@@ -879,19 +901,14 @@ def ui():
         inputs=[
             gr.Image(type="pil", label="Upload scanned page / receipt / document"),
             gr.Radio(
-                choices=["OpenAI Vision", "Tesseract"],
-                value="OpenAI Vision",
+                choices=["Surya", "Tesseract"],
+                value="Surya",
                 label="Engine",
-            ),
-            gr.Textbox(
-                type="password",
-                label="OpenAI API key (optional)",
-                placeholder="Uses deployed OPENAI_API_KEY if configured",
             ),
         ],
         outputs=gr.Textbox(label="Extracted text", lines=24),
         title="Fast Document OCR",
-        description="Vision-first transcription with document OCR fallback.",
+        description="Surya document OCR with Tesseract fallback.",
     )
     blocks.enable_queue = False
 

@@ -1,5 +1,4 @@
 import importlib.util
-import os
 import sys
 import types
 from pathlib import Path
@@ -58,9 +57,6 @@ class _FakeImage:
     def crop(self, box):
         left, top, right, bottom = box
         return _FakeImage(right - left, bottom - top)
-
-    def save(self, buffer, format="PNG"):
-        buffer.write(b"fake-image-bytes")
 
 
 def test_extract_text_drops_low_confidence_noise():
@@ -292,22 +288,31 @@ def test_parse_tesseract_data_converts_word_boxes():
     ]
 
 
-def test_pil_image_to_data_url_returns_png_data_url():
-    image = _FakeImage(100, 100)
+def test_surya_line_to_result_uses_bbox_when_polygon_missing():
+    line = {
+        "text": "Broward Health",
+        "confidence": 0.93,
+        "bbox": [10, 12, 150, 32],
+    }
 
-    url = modal_app.pil_image_to_data_url(image, format="PNG")
+    result = modal_app.surya_line_to_result(line)
 
-    assert url.startswith("data:image/png;base64,")
+    assert result == (_box(10, 12, 150, 32), "Broward Health", 0.93)
 
 
-def test_get_openai_api_key_prefers_explicit_key():
-    previous = os.environ.get("OPENAI_API_KEY")
-    os.environ["OPENAI_API_KEY"] = "env-key"
-    try:
-        assert modal_app.get_openai_api_key("explicit-key") == "explicit-key"
-        assert modal_app.get_openai_api_key("") == "env-key"
-    finally:
-        if previous is None:
-            os.environ.pop("OPENAI_API_KEY", None)
-        else:
-            os.environ["OPENAI_API_KEY"] = previous
+def test_parse_surya_predictions_collects_text_lines():
+    predictions = [
+        {
+            "text_lines": [
+                {"text": "Epic Team Staff Levels", "confidence": 0.96, "bbox": [10, 10, 220, 30]},
+                {"text": "Associate", "confidence": 0.95, "bbox": [12, 48, 100, 70]},
+            ]
+        }
+    ]
+
+    result = modal_app.parse_surya_predictions(predictions)
+
+    assert result == [
+        (_box(10, 10, 220, 30), "Epic Team Staff Levels", 0.96),
+        (_box(12, 48, 100, 70), "Associate", 0.95),
+    ]
