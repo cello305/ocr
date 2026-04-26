@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -57,6 +58,9 @@ class _FakeImage:
     def crop(self, box):
         left, top, right, bottom = box
         return _FakeImage(right - left, bottom - top)
+
+    def save(self, buffer, format="PNG"):
+        buffer.write(b"fake-image-bytes")
 
 
 def test_extract_text_drops_low_confidence_noise():
@@ -286,3 +290,24 @@ def test_parse_tesseract_data_converts_word_boxes():
         (_box(10, 12, 80, 32), "Broward", 0.96),
         (_box(90, 12, 150, 32), "Health", 0.93),
     ]
+
+
+def test_pil_image_to_data_url_returns_png_data_url():
+    image = _FakeImage(100, 100)
+
+    url = modal_app.pil_image_to_data_url(image, format="PNG")
+
+    assert url.startswith("data:image/png;base64,")
+
+
+def test_get_openai_api_key_prefers_explicit_key():
+    previous = os.environ.get("OPENAI_API_KEY")
+    os.environ["OPENAI_API_KEY"] = "env-key"
+    try:
+        assert modal_app.get_openai_api_key("explicit-key") == "explicit-key"
+        assert modal_app.get_openai_api_key("") == "env-key"
+    finally:
+        if previous is None:
+            os.environ.pop("OPENAI_API_KEY", None)
+        else:
+            os.environ["OPENAI_API_KEY"] = previous

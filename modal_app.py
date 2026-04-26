@@ -1,3 +1,6 @@
+import base64
+import io
+import os
 import re
 
 import modal
@@ -14,6 +17,7 @@ MAX_SKEW_CORRECTION_DEGREES = 4.0
 TILE_OVERLAP_RATIO = 0.18
 MIN_TILE_HEIGHT = 900
 TESSERACT_PSMS = (3, 4, 6)
+OPENAI_VISION_MODEL = "gpt-4.1-mini"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -27,6 +31,7 @@ image = (
         "gradio==6.9.0",
         "numpy",
         "opencv-python-headless==4.10.0.84",
+        "openai",
         "Pillow",
         "pytesseract",
         "wordninja",
@@ -187,6 +192,60 @@ def build_ocr_variants(image):
 
 def normalize_image(image):
     return build_ocr_variants(image)[0]["image"]
+
+
+def pil_image_to_data_url(image, format="PNG"):
+    buffer = io.BytesIO()
+    image.save(buffer, format=format)
+    mime_type = "image/png" if format.upper() == "PNG" else "image/jpeg"
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def get_openai_api_key(explicit_key=""):
+    return (explicit_key or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()
+
+
+def run_openai_vision_text(image, api_key):
+    from openai import OpenAI
+
+    variants = {variant["name"]: variant["image"] for variant in build_ocr_variants(image)}
+    original = resize_image_for_ocr(image)
+    normalized = variants.get("shadow_reduced") or variants.get("grayscale") or original
+
+    client = OpenAI(api_key=api_key)
+    response = client.responses.create(
+        model=OPENAI_VISION_MODEL,
+        max_output_tokens=3000,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Transcribe this photographed printed document to plain text. "
+                            "Preserve headings, paragraph breaks, and numbered items. "
+                            "Fix obvious line-wrap splits and broken words when the intended text is clear. "
+                            "Do not add commentary. Omit visual artifacts, shadows, staples, page edges, coordinates, "
+                            "or gibberish that is not document text."
+                        ),
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": pil_image_to_data_url(original, format="JPEG"),
+                        "detail": "high",
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": pil_image_to_data_url(normalized, format="PNG"),
+                        "detail": "high",
+                    },
+                ],
+            }
+        ],
+    )
+    return cleanup_extracted_text(getattr(response, "output_text", "") or "")
 
 
 def build_ocr_inputs(image):
@@ -786,9 +845,15 @@ def ui():
 
     web_app = FastAPI()
 
-    def process_document(image):
+    def process_document(image, engine, api_key):
         if image is None:
             return "Please upload an image."
+
+        resolved_api_key = get_openai_api_key(api_key)
+        if engine == "OpenAI Vision" and resolved_api_key:
+            text = run_openai_vision_text(image, resolved_api_key)
+            if text:
+                return text
 
         text_candidates = build_tesseract_text_candidates(image)
         raw_candidates = []
@@ -811,10 +876,22 @@ def ui():
 
     blocks = gr.Interface(
         fn=process_document,
-        inputs=gr.Image(type="pil", label="Upload scanned page / receipt / document"),
+        inputs=[
+            gr.Image(type="pil", label="Upload scanned page / receipt / document"),
+            gr.Radio(
+                choices=["OpenAI Vision", "Tesseract"],
+                value="OpenAI Vision",
+                label="Engine",
+            ),
+            gr.Textbox(
+                type="password",
+                label="OpenAI API key (optional)",
+                placeholder="Uses deployed OPENAI_API_KEY if configured",
+            ),
+        ],
         outputs=gr.Textbox(label="Extracted text", lines=24),
-        title="Fast Document OCR - Tesseract",
-        description="Document-focused OCR for scanned pages and phone photos on Modal. Tuned for policy pages, forms, and printed documents.",
+        title="Fast Document OCR",
+        description="Vision-first transcription with document OCR fallback.",
     )
     blocks.enable_queue = False
 
