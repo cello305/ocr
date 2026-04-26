@@ -859,7 +859,7 @@ def choose_best_ocr_candidate(candidates):
     max_containers=1,
     scaledown_window=600,
 )
-@modal.asgi_app(label="ocr")
+@modal.asgi_app(label="surya-ocr")
 def ui():
     import gradio as gr
     from fastapi import FastAPI
