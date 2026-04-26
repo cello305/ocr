@@ -3,7 +3,7 @@ import re
 import modal
 
 
-APP_NAME = "ocr-test-tesseract"
+APP_NAME = "ocr-test-rapidocr"
 CPU_THREADS = 2
 MAX_IMAGE_EDGE = 1800
 TARGET_MIN_IMAGE_EDGE = 1400
@@ -13,7 +13,7 @@ SHORT_TEXT_MIN_CONFIDENCE = 0.55
 MAX_SKEW_CORRECTION_DEGREES = 4.0
 TILE_OVERLAP_RATIO = 0.18
 MIN_TILE_HEIGHT = 900
-TESSERACT_PSM = 6
+TESSERACT_PSMS = (3, 4, 6)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -333,9 +333,34 @@ def run_tesseract(image):
     data = pytesseract.image_to_data(
         image,
         output_type=pytesseract.Output.DICT,
-        config=f"--oem 3 --psm {TESSERACT_PSM} -c preserve_interword_spaces=1",
+        config="--oem 3 --psm 6 -c preserve_interword_spaces=1",
     )
     return parse_tesseract_data(data)
+
+
+def run_tesseract_text(image, psm):
+    import pytesseract
+
+    return pytesseract.image_to_string(
+        image,
+        config=f"--oem 3 --psm {psm} -c preserve_interword_spaces=1",
+    )
+
+
+def build_tesseract_text_candidates(image):
+    candidates = []
+    for variant in build_ocr_variants(image):
+        for psm in TESSERACT_PSMS:
+            raw_text = run_tesseract_text(variant["image"], psm)
+            candidates.append(
+                {
+                    "name": f"tesseract_text:{variant['name']}:psm{psm}",
+                    "group": f"tesseract_text:{variant['name']}:psm{psm}",
+                    "result": [],
+                    "text": cleanup_extracted_text(raw_text),
+                }
+            )
+    return candidates
 
 
 def group_ocr_candidates(raw_candidates):
@@ -418,6 +443,7 @@ def cleanup_extracted_text(text):
         line = re.sub(r"([(\[])\s+", r"\1", line)
         line = re.sub(r"\s+([)\]])", r"\1", line)
         line = re.sub(r"\b([A-Za-z]{2,})\s*-\s*([A-Za-z]{2,})\b", r"\1-\2", line)
+        line = re.sub(r"\b([A-Za-z]{1,4})\s+ware\b", r"\1ware", line, flags=re.IGNORECASE)
 
         if (
             line.endswith(("'", "`"))
@@ -709,16 +735,26 @@ def score_ocr_candidate(text, result):
         for i in range(1, len(lines))
         if lines_look_duplicated(lines[i - 1], lines[i])
     )
+    heading_hits = sum(
+        1
+        for line in lines
+        if _looks_like_heading(line)
+    )
+    numbered_lines = sum(1 for line in lines if re.match(r"^\d+\.\s", line))
+    likely_bad_title = 1 if any("rapidocr" in line.lower() for line in lines[:3]) else 0
 
     return (
         (sum(confidences) / max(len(confidences), 1)) * 4.0
         + min(alnum_chars, 800) * 0.025
         + len(lines) * 0.2
+        + heading_hits * 0.4
+        + min(numbered_lines, 8) * 0.25
         - short_lines * 0.25
         - orphan_lowercase_lines * 0.6
         - dangling_lines * 0.8
         - suspicious_numeric_lines * 1.5
         - duplicate_lines * 1.0
+        - likely_bad_title * 1.5
     )
 
 
@@ -754,6 +790,7 @@ def ui():
         if image is None:
             return "Please upload an image."
 
+        text_candidates = build_tesseract_text_candidates(image)
         raw_candidates = []
         for ocr_input in build_ocr_inputs(image):
             raw_candidates.append(
@@ -768,7 +805,7 @@ def ui():
                 }
             )
 
-        candidates = group_ocr_candidates(raw_candidates)
+        candidates = text_candidates + group_ocr_candidates(raw_candidates)
         best_candidate = choose_best_ocr_candidate(candidates)
         return best_candidate["text"] if best_candidate and best_candidate["text"] else "No text detected."
 

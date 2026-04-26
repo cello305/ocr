@@ -193,6 +193,24 @@ def test_score_ocr_candidate_penalizes_orphan_lowercase_lines():
     assert clean_score > noisy_score
 
 
+def test_score_ocr_candidate_penalizes_bad_title_text():
+    clean_text = (
+        "Broward Health\n"
+        "Expectations by Staff Level\n"
+        "Effective June 5, 2025"
+    )
+    noisy_text = (
+        "RapidOCR\n"
+        "Expectations by Staff Level\n"
+        "Effective June 5, 2025"
+    )
+
+    clean_score = modal_app.score_ocr_candidate(clean_text, [])
+    noisy_score = modal_app.score_ocr_candidate(noisy_text, [])
+
+    assert clean_score > noisy_score
+
+
 def test_score_ocr_candidate_penalizes_duplicate_and_numeric_noise():
     cleaner_text = (
         "Effective June 5, 2025\n"
