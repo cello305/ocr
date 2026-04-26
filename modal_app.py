@@ -270,9 +270,6 @@ def run_surya_cli(image):
             str(input_path),
             "--output_dir",
             str(output_dir),
-            "--task_name",
-            "ocr_with_boxes",
-            "--disable_math",
         ]
         subprocess.run(command, check=True, capture_output=True, text=True)
 
