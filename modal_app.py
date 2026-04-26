@@ -1,4 +1,8 @@
 import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 import modal
 
@@ -43,7 +47,6 @@ image = (
 )
 
 app = modal.App(APP_NAME)
-_surya_predictors = None
 
 
 def resize_image_for_ocr(image):
@@ -192,22 +195,6 @@ def normalize_image(image):
     return build_ocr_variants(image)[0]["image"]
 
 
-def get_surya_predictors():
-    global _surya_predictors
-    if _surya_predictors is not None:
-        return _surya_predictors
-
-    from surya.foundation import FoundationPredictor
-    from surya.recognition import RecognitionPredictor
-    from surya.detection import DetectionPredictor
-
-    foundation_predictor = FoundationPredictor()
-    recognition_predictor = RecognitionPredictor(foundation_predictor)
-    detection_predictor = DetectionPredictor()
-    _surya_predictors = (recognition_predictor, detection_predictor)
-    return _surya_predictors
-
-
 def _box_to_polygon(box):
     if not box or len(box) != 4:
         return None
@@ -250,14 +237,13 @@ def parse_surya_predictions(predictions):
 
 
 def build_surya_candidates(image):
-    recognition_predictor, detection_predictor = get_surya_predictors()
     variants = [
         variant for variant in build_ocr_variants(image)
         if variant["name"] in {"shadow_reduced", "grayscale"}
     ]
     candidates = []
     for variant in variants:
-        predictions = recognition_predictor([variant["image"]], det_predictor=detection_predictor)
+        predictions = run_surya_cli(variant["image"])
         result = parse_surya_predictions(predictions)
         candidates.append(
             {
@@ -268,6 +254,34 @@ def build_surya_candidates(image):
             }
         )
     return candidates
+
+
+def run_surya_cli(image):
+    import json
+
+    with tempfile.TemporaryDirectory(prefix="surya-ocr-") as temp_dir:
+        temp_path = Path(temp_dir)
+        input_path = temp_path / "input.png"
+        output_dir = temp_path / "output"
+        image.save(input_path)
+
+        command = [
+            shutil.which("surya_ocr") or "surya_ocr",
+            str(input_path),
+            "--output_dir",
+            str(output_dir),
+            "--task_name",
+            "ocr_with_boxes",
+            "--disable_math",
+        ]
+        subprocess.run(command, check=True, capture_output=True, text=True)
+
+        results_path = output_dir / "results.json"
+        with results_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        page_results = payload.get("input") or payload.get(input_path.stem) or []
+        return page_results
 
 
 def build_ocr_inputs(image):

@@ -316,3 +316,19 @@ def test_parse_surya_predictions_collects_text_lines():
         (_box(10, 10, 220, 30), "Epic Team Staff Levels", 0.96),
         (_box(12, 48, 100, 70), "Associate", 0.95),
     ]
+
+
+def test_parse_surya_predictions_handles_stemmed_cli_payload():
+    predictions = [
+        {
+            "text_lines": [
+                {"text": "Technical Responsibilities", "confidence": 0.97, "bbox": [20, 100, 260, 125]},
+            ]
+        }
+    ]
+
+    result = modal_app.parse_surya_predictions(predictions)
+
+    assert result == [
+        (_box(20, 100, 260, 125), "Technical Responsibilities", 0.97),
+    ]
