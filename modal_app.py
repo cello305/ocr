@@ -15,19 +15,6 @@ TILE_OVERLAP_RATIO = 0.18
 MIN_TILE_HEIGHT = 900
 TESSERACT_PSMS = (3, 4, 6)
 
-def _download_surya_models():
-    """Pre-download Surya model weights at image build time."""
-    import os
-    os.environ["TORCH_DEVICE"] = "cpu"
-    from surya.detection import DetectionPredictor
-    from surya.foundation import FoundationPredictor
-    from surya.recognition import RecognitionPredictor
-
-    foundation = FoundationPredictor()
-    RecognitionPredictor(foundation)
-    DetectionPredictor()
-
-
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install(
@@ -42,20 +29,13 @@ image = (
         "opencv-python-headless",
         "Pillow",
         "pytesseract",
-        "requests",
-        "surya-ocr>=0.17.0",
-        "torch==2.7.1",
-        "transformers>=4.56.1,<5.0.0",
+        "rapidocr-onnxruntime",
         "wordninja",
     )
-    .run_function(_download_surya_models)
     .env(
         {
             "OMP_NUM_THREADS": str(CPU_THREADS),
             "MKL_NUM_THREADS": str(CPU_THREADS),
-            "TORCH_DEVICE": "cpu",
-            "RECOGNITION_BATCH_SIZE": "4",
-            "DETECTOR_BATCH_SIZE": "2",
             "GRADIO_TEMP_DIR": "/tmp/gradio",
         }
     )
@@ -210,89 +190,54 @@ def normalize_image(image):
     return build_ocr_variants(image)[0]["image"]
 
 
-def _box_to_polygon(box):
-    if not box or len(box) != 4:
-        return None
-    x1, y1, x2, y2 = box
-    return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+_rapidocr_engine = None
 
 
-def surya_line_to_result(line):
-    text = getattr(line, "text", None)
-    confidence = getattr(line, "confidence", None)
-    polygon = getattr(line, "polygon", None)
-    bbox = getattr(line, "bbox", None)
-    if isinstance(line, dict):
-        text = line.get("text", text)
-        confidence = line.get("confidence", confidence)
-        polygon = line.get("polygon", polygon)
-        bbox = line.get("bbox", bbox)
-
-    if not text:
-        return None
-    if polygon is None:
-        polygon = _box_to_polygon(bbox)
-    if polygon is None:
-        return None
-    score = float(confidence) if confidence is not None else 0.9
-    return (polygon, text, score)
+def _get_rapidocr():
+    global _rapidocr_engine
+    if _rapidocr_engine is None:
+        from rapidocr_onnxruntime import RapidOCR
+        _rapidocr_engine = RapidOCR()
+    return _rapidocr_engine
 
 
-def parse_surya_predictions(predictions):
+def run_rapidocr(image):
+    """Run RapidOCR on a PIL image and return list of (polygon, text, score)."""
+    import numpy as np
+
+    ocr = _get_rapidocr()
+    img_array = np.array(image)
+    result, _ = ocr(img_array)
+    if not result:
+        return []
     parsed = []
-    for prediction in predictions or []:
-        text_lines = getattr(prediction, "text_lines", None)
-        if isinstance(prediction, dict):
-            text_lines = prediction.get("text_lines", text_lines)
-        for line in text_lines or []:
-            item = surya_line_to_result(line)
-            if item is not None:
-                parsed.append(item)
+    for item in result:
+        box, text, score = item
+        if not text or not text.strip():
+            continue
+        polygon = [[float(pt[0]), float(pt[1])] for pt in box]
+        parsed.append((polygon, text.strip(), float(score)))
     return parsed
 
 
-def build_surya_candidates(image):
+def build_rapidocr_candidates(image):
+    """Build OCR candidates using RapidOCR on preprocessed image variants."""
     variants = [
         variant for variant in build_ocr_variants(image)
         if variant["name"] in {"shadow_reduced", "grayscale"}
     ]
     candidates = []
     for variant in variants:
-        predictions = run_surya_ocr(variant["image"])
-        result = parse_surya_predictions(predictions)
+        result = run_rapidocr(variant["image"])
         candidates.append(
             {
-                "name": f"surya:{variant['name']}",
-                "group": f"surya:{variant['name']}",
+                "name": f"rapidocr:{variant['name']}",
+                "group": f"rapidocr:{variant['name']}",
                 "result": result,
                 "text": extract_text(result),
             }
         )
     return candidates
-
-
-_surya_recognition_predictor = None
-_surya_detection_predictor = None
-
-
-def _get_surya_predictors():
-    global _surya_recognition_predictor, _surya_detection_predictor
-    if _surya_recognition_predictor is None:
-        from surya.detection import DetectionPredictor
-        from surya.foundation import FoundationPredictor
-        from surya.recognition import RecognitionPredictor
-
-        foundation = FoundationPredictor()
-        _surya_recognition_predictor = RecognitionPredictor(foundation)
-        _surya_detection_predictor = DetectionPredictor()
-    return _surya_recognition_predictor, _surya_detection_predictor
-
-
-def run_surya_ocr(image):
-    """Run Surya OCR using the Python API and return predictions list."""
-    rec_predictor, det_predictor = _get_surya_predictors()
-    predictions = rec_predictor([image], det_predictor=det_predictor)
-    return predictions
 
 
 def build_ocr_inputs(image):
@@ -880,7 +825,7 @@ def choose_best_ocr_candidate(candidates):
 @app.function(
     image=image,
     cpu=2,
-    memory=8192,
+    memory=2048,
     max_containers=1,
     scaledown_window=600,
 )
@@ -896,8 +841,8 @@ def ui():
         if image is None:
             return "Please upload an image."
 
-        if engine == "Surya":
-            candidates = build_surya_candidates(image)
+        if engine == "RapidOCR":
+            candidates = build_rapidocr_candidates(image)
             best_candidate = choose_best_ocr_candidate(candidates)
             if best_candidate and best_candidate["text"]:
                 return best_candidate["text"]
@@ -926,14 +871,14 @@ def ui():
         inputs=[
             gr.Image(type="pil", label="Upload scanned page / receipt / document"),
             gr.Radio(
-                choices=["Surya", "Tesseract"],
-                value="Surya",
+                choices=["RapidOCR", "Tesseract"],
+                value="RapidOCR",
                 label="Engine",
             ),
         ],
         outputs=gr.Textbox(label="Extracted text", lines=24),
         title="Fast Document OCR",
-        description="Surya document OCR with Tesseract fallback.",
+        description="RapidOCR (ONNX) document OCR with Tesseract fallback.",
     )
     blocks.enable_queue = False
 
