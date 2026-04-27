@@ -197,7 +197,7 @@ def _get_rapidocr():
     global _rapidocr_engine
     if _rapidocr_engine is None:
         from rapidocr_onnxruntime import RapidOCR
-        _rapidocr_engine = RapidOCR()
+        _rapidocr_engine = RapidOCR(det_limit_side_len=MAX_IMAGE_EDGE)
     return _rapidocr_engine
 
 
@@ -221,15 +221,13 @@ def run_rapidocr(image):
 
 
 def build_rapidocr_candidates(image):
-    """Build OCR candidates using RapidOCR on preprocessed image variants."""
-    variants = [
-        variant for variant in build_ocr_variants(image)
-        if variant["name"] in {"shadow_reduced", "grayscale"}
-    ]
-    candidates = []
+    """Build OCR candidates using RapidOCR on all preprocessed image variants
+    plus tiles for tall documents to maximize text coverage."""
+    variants = build_ocr_variants(image)
+    raw_candidates = []
     for variant in variants:
         result = run_rapidocr(variant["image"])
-        candidates.append(
+        raw_candidates.append(
             {
                 "name": f"rapidocr:{variant['name']}",
                 "group": f"rapidocr:{variant['name']}",
@@ -237,7 +235,21 @@ def build_rapidocr_candidates(image):
                 "text": extract_text(result),
             }
         )
-    return candidates
+        # Also run on tiles for tall documents
+        for tile_input in build_tiled_ocr_inputs(variant["image"], variant["name"]):
+            tile_result = run_rapidocr(tile_input["image"])
+            raw_candidates.append(
+                {
+                    "name": f"rapidocr:{tile_input['name']}",
+                    "group": f"rapidocr:{tile_input['group']}",
+                    "result": offset_ocr_result(
+                        tile_result,
+                        offset_x=tile_input["offset_x"],
+                        offset_y=tile_input["offset_y"],
+                    ),
+                }
+            )
+    return group_ocr_candidates(raw_candidates)
 
 
 def build_ocr_inputs(image):
@@ -477,6 +489,53 @@ def fix_word_spacing(text):
     return " ".join(fixed)
 
 
+def is_garbage_text(text):
+    """Detect OCR noise — strings that are mostly random characters, not real words."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+
+    # Don't filter numbered items (e.g. "1.", "2.")
+    if re.fullmatch(r"\d{1,2}\.", stripped):
+        return False
+
+    # Very short meaningless fragments (e.g. single punctuation or symbols)
+    if len(stripped) <= 2 and not stripped[0].isalpha():
+        return True
+
+    # Strings that are mostly non-alphabetic characters
+    alpha_chars = sum(1 for c in stripped if c.isalpha())
+    total_chars = len(stripped.replace(" ", ""))
+    if total_chars >= 4 and alpha_chars / max(total_chars, 1) < 0.5:
+        return True
+
+    # Short-word soup: many very short tokens that don't form a sentence
+    # e.g. "omo 5 n solo y" — mostly 1-2 char tokens
+    tokens = stripped.split()
+    if len(tokens) >= 3:
+        short_tokens = sum(1 for t in tokens if len(t) <= 2)
+        if short_tokens / len(tokens) >= 0.6 and total_chars <= 20:
+            return True
+
+    # Short strings with unusual character density (mixed digits/letters/symbols)
+    if len(tokens) <= 4 and total_chars >= 4:
+        # Check if most tokens look like gibberish (not dictionary-like)
+        gibberish_count = 0
+        for token in tokens:
+            clean_token = re.sub(r"[^a-zA-Z]", "", token)
+            if len(clean_token) >= 3:
+                # Check for unlikely letter patterns (too many consonant clusters)
+                vowels = sum(1 for c in clean_token.lower() if c in "aeiou")
+                if vowels / max(len(clean_token), 1) < 0.15:
+                    gibberish_count += 1
+            elif len(token) >= 3 and not clean_token:
+                gibberish_count += 1
+        if gibberish_count >= max(len(tokens) // 2, 1) and len(tokens) <= 3:
+            return True
+
+    return False
+
+
 def cleanup_extracted_text(text):
     if not text:
         return ""
@@ -507,11 +566,14 @@ def cleanup_extracted_text(text):
         if re.fullmatch(r"[_=\-~]{3,}", line):
             continue
 
+        # Strip trailing garbage fragments (e.g. "... results. 01n9mm01002k:")
+        line = re.sub(r"\s+[A-Za-z0-9]{6,}\s*[:;]\s*$", "", line)
+
         cleaned_lines.append(line)
 
     cleaned = "\n".join(cleaned_lines)
     cleaned = re.sub(r"(?<=\d)\.(?=[A-Z])", ". ", cleaned)
-    cleaned = re.sub(r"(?<!\n)(?=(?:\d{1,2}\.)\s*[A-Z])", "\n", cleaned)
+    cleaned = re.sub(r"(?<=\S)\s+(?=\d{1,2}\.\s*[A-Z])", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     normalized_lines = []
     for raw_line in cleaned.splitlines():
@@ -522,6 +584,8 @@ def cleanup_extracted_text(text):
         for line in split_inline_numbered_items(raw_line):
             if is_suspicious_numeric_line(line):
                 continue
+            if is_garbage_text(line):
+                continue
             if normalized_lines and lines_look_duplicated(normalized_lines[-1], line):
                 continue
             normalized_lines.append(line)
@@ -531,8 +595,32 @@ def cleanup_extracted_text(text):
 
 
 def split_inline_numbered_items(line):
-    parts = re.split(r"(?=(?:^|\s)(?:\d{1,2}\.)\s*[A-Z])", line)
-    return [part.strip() for part in parts if part and part.strip()]
+    # Split on numbered items ("1. Foo" or "2.Foo") that appear mid-line
+    # after other text, AND also on titled sections that start after a
+    # sentence end ("...maintainability. Testing and Quality Assurance:")
+    # Important: don't split if the numbered item is at the very start
+    # of the line — that's the line's own number, not an inline item.
+    parts = re.split(r"(?<=\S)\s+(?=\d{1,2}\.\s*[A-Z])", line)
+    final = []
+    for part in parts:
+        if not part or not part.strip():
+            continue
+        # Further split on sentence-ending period followed by a capitalized
+        # multi-word label with a colon (typical section/item header).
+        # Use (?<=\w)\. to ensure the period follows a word char, not a digit
+        # (which would be a numbered list marker like "2.").
+        subparts = re.split(
+            r"(?<=\w)(?<!\d)\.\s+(?=[A-Z][a-z]+ (?:and |the |of |in |for )?[A-Z][a-z]+.*?:)",
+            part,
+        )
+        for i, sp in enumerate(subparts):
+            stripped = sp.strip()
+            if stripped:
+                # Re-add the period that was consumed by the split
+                if i < len(subparts) - 1 and not stripped.endswith("."):
+                    stripped += "."
+                final.append(stripped)
+    return final
 
 
 def is_suspicious_numeric_line(text):

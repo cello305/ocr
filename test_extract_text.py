@@ -288,47 +288,34 @@ def test_parse_tesseract_data_converts_word_boxes():
     ]
 
 
-def test_surya_line_to_result_uses_bbox_when_polygon_missing():
-    line = {
-        "text": "Broward Health",
-        "confidence": 0.93,
-        "bbox": [10, 12, 150, 32],
-    }
-
-    result = modal_app.surya_line_to_result(line)
-
-    assert result == (_box(10, 12, 150, 32), "Broward Health", 0.93)
+def test_is_garbage_text_detects_random_strings():
+    assert modal_app.is_garbage_text("01n9mm01002k:")
+    assert modal_app.is_garbage_text("omo 5 n solo y")
+    assert not modal_app.is_garbage_text("System Support: Help troubleshoot and resolve technical issues.")
+    assert not modal_app.is_garbage_text("Broward Health")
+    assert not modal_app.is_garbage_text("1. Coding and Development")
+    assert not modal_app.is_garbage_text("manager.")
 
 
-def test_parse_surya_predictions_collects_text_lines():
-    predictions = [
-        {
-            "text_lines": [
-                {"text": "Epic Team Staff Levels", "confidence": 0.96, "bbox": [10, 10, 220, 30]},
-                {"text": "Associate", "confidence": 0.95, "bbox": [12, 48, 100, 70]},
-            ]
-        }
-    ]
+def test_split_inline_numbered_items_splits_section_headers():
+    line = (
+        "code comments, to ensure clarity and maintainability. "
+        "Testing and Quality Assurance: Conduct unit testing."
+    )
 
-    result = modal_app.parse_surya_predictions(predictions)
+    result = modal_app.split_inline_numbered_items(line)
 
-    assert result == [
-        (_box(10, 10, 220, 30), "Epic Team Staff Levels", 0.96),
-        (_box(12, 48, 100, 70), "Associate", 0.95),
-    ]
+    assert len(result) == 2
+    assert result[0] == "code comments, to ensure clarity and maintainability."
+    assert result[1] == "Testing and Quality Assurance: Conduct unit testing."
 
 
-def test_parse_surya_predictions_handles_stemmed_cli_payload():
-    predictions = [
-        {
-            "text_lines": [
-                {"text": "Technical Responsibilities", "confidence": 0.97, "bbox": [20, 100, 260, 125]},
-            ]
-        }
-    ]
+def test_cleanup_strips_trailing_garbage():
+    raw_text = (
+        "All new code or functions must have documented testing results. 01n9mm01002k:"
+    )
 
-    result = modal_app.parse_surya_predictions(predictions)
+    text = modal_app.cleanup_extracted_text(raw_text)
 
-    assert result == [
-        (_box(20, 100, 260, 125), "Technical Responsibilities", 0.97),
-    ]
+    assert "01n9mm01002k" not in text
+    assert "testing results" in text.lower()
