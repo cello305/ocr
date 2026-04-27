@@ -352,9 +352,6 @@ def dedupe_ocr_results(result):
         normalized_text = re.sub(r"\s+", " ", raw_text).strip().lower()
         duplicate_found = False
         for kept in deduped:
-            kept_text = re.sub(r"\s+", " ", (kept[1] or "").strip()).lower()
-            if normalized_text != kept_text:
-                continue
             if _intersection_over_union(box, kept[0]) >= 0.5:
                 duplicate_found = True
                 break
@@ -523,8 +520,9 @@ def is_garbage_text(text):
     # Very short text where the alphabetic content is minimal or punctuation ratio is high
     # e.g. "A!*1 ti:", "p\".", ": manager. p\"."
     alpha_words = alpha_only.split()
+    alnum_chars = sum(1 for ch in stripped if ch.isalnum())
     if len(alpha_words) <= 2 and total_chars >= 3:
-        if alpha_chars <= 4 or alpha_chars / max(total_chars, 1) < 0.7:
+        if alpha_chars <= 4 or alnum_chars / max(total_chars, 1) < 0.7:
             return True
 
     # Short strings with unusual character density (mixed digits/letters/symbols)
@@ -908,9 +906,9 @@ def score_ocr_candidate(text, result):
 
     return (
         (sum(confidences) / max(len(confidences), 1)) * 4.0
-        + min(alnum_chars, 800) * 0.025
-        + len(lines) * 0.2
-        + heading_hits * 0.4
+        + alnum_chars * 0.030
+        + len(lines) * 0.5
+        + heading_hits * 0.6
         + min(numbered_lines, 8) * 0.25
         - short_lines * 0.25
         - orphan_lowercase_lines * 0.6
