@@ -1,8 +1,4 @@
 import re
-import shutil
-import subprocess
-import tempfile
-from pathlib import Path
 
 import modal
 
@@ -19,6 +15,19 @@ TILE_OVERLAP_RATIO = 0.18
 MIN_TILE_HEIGHT = 900
 TESSERACT_PSMS = (3, 4, 6)
 
+def _download_surya_models():
+    """Pre-download Surya model weights at image build time."""
+    import os
+    os.environ["TORCH_DEVICE"] = "cpu"
+    from surya.detection import DetectionPredictor
+    from surya.foundation import FoundationPredictor
+    from surya.recognition import RecognitionPredictor
+
+    foundation = FoundationPredictor()
+    RecognitionPredictor(foundation)
+    DetectionPredictor()
+
+
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install(
@@ -30,17 +39,23 @@ image = (
         "fastapi==0.115.12",
         "gradio==6.9.0",
         "numpy",
-        "opencv-python-headless==4.10.0.84",
+        "opencv-python-headless",
         "Pillow",
         "pytesseract",
-        "surya-ocr",
+        "requests",
+        "surya-ocr>=0.17.0",
         "torch==2.7.1",
+        "transformers>=4.56.1,<5.0.0",
         "wordninja",
     )
+    .run_function(_download_surya_models)
     .env(
         {
             "OMP_NUM_THREADS": str(CPU_THREADS),
             "MKL_NUM_THREADS": str(CPU_THREADS),
+            "TORCH_DEVICE": "cpu",
+            "RECOGNITION_BATCH_SIZE": "4",
+            "DETECTOR_BATCH_SIZE": "2",
             "GRADIO_TEMP_DIR": "/tmp/gradio",
         }
     )
@@ -243,7 +258,7 @@ def build_surya_candidates(image):
     ]
     candidates = []
     for variant in variants:
-        predictions = run_surya_cli(variant["image"])
+        predictions = run_surya_ocr(variant["image"])
         result = parse_surya_predictions(predictions)
         candidates.append(
             {
@@ -256,29 +271,28 @@ def build_surya_candidates(image):
     return candidates
 
 
-def run_surya_cli(image):
-    import json
+_surya_recognition_predictor = None
+_surya_detection_predictor = None
 
-    with tempfile.TemporaryDirectory(prefix="surya-ocr-") as temp_dir:
-        temp_path = Path(temp_dir)
-        input_path = temp_path / "input.png"
-        output_dir = temp_path / "output"
-        image.save(input_path)
 
-        command = [
-            shutil.which("surya_ocr") or "surya_ocr",
-            str(input_path),
-            "--output_dir",
-            str(output_dir),
-        ]
-        subprocess.run(command, check=True, capture_output=True, text=True)
+def _get_surya_predictors():
+    global _surya_recognition_predictor, _surya_detection_predictor
+    if _surya_recognition_predictor is None:
+        from surya.detection import DetectionPredictor
+        from surya.foundation import FoundationPredictor
+        from surya.recognition import RecognitionPredictor
 
-        results_path = output_dir / "results.json"
-        with results_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        foundation = FoundationPredictor()
+        _surya_recognition_predictor = RecognitionPredictor(foundation)
+        _surya_detection_predictor = DetectionPredictor()
+    return _surya_recognition_predictor, _surya_detection_predictor
 
-        page_results = payload.get("input") or payload.get(input_path.stem) or []
-        return page_results
+
+def run_surya_ocr(image):
+    """Run Surya OCR using the Python API and return predictions list."""
+    rec_predictor, det_predictor = _get_surya_predictors()
+    predictions = rec_predictor([image], det_predictor=det_predictor)
+    return predictions
 
 
 def build_ocr_inputs(image):
@@ -866,7 +880,7 @@ def choose_best_ocr_candidate(candidates):
 @app.function(
     image=image,
     cpu=2,
-    memory=3072,
+    memory=8192,
     max_containers=1,
     scaledown_window=600,
 )
