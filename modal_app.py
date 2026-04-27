@@ -587,6 +587,18 @@ def cleanup_extracted_text(text):
         # Strip trailing short garbage after sentence-ending period
         # e.g. "...senior team members. *x $." → "...senior team members."
         line = re.sub(r"(?<=[.!?])\s+\S{1,4}\s+\S{1,3}[.!?]?\s*$", "", line)
+        
+        # Strip trailing single-word garbage after a period
+        # e.g. "manager. p\"." -> "manager."
+        line = re.sub(r"(?<=[a-zA-Z]{3}[.!?])\s+[^a-zA-Z0-9\s]*[a-zA-Z]?[^a-zA-Z0-9\s]*$", "", line)
+        
+        # Strip specific garbage patterns attached to valid words
+        # e.g., 'Associate.A!*1 ti:' -> 'Associate.'
+        line = re.sub(r"(?<=[a-zA-Z]{3})\.[A-Z]![*^0-9\s]+.*$", ".", line)
+        
+        # Strip inline noise between sentences
+        # e.g., 'Skills +. I. Analyze' -> 'Skills. Analyze'
+        line = re.sub(r"(?<=[a-zA-Z])\s*\+\.\s*I\.\s*(?=[A-Z])", ". ", line)
 
         if not line.strip():
             continue

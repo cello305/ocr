@@ -294,7 +294,6 @@ def test_is_garbage_text_detects_random_strings():
     assert modal_app.is_garbage_text("omo 5 n solo y")
     assert modal_app.is_garbage_text("A!*1 ti:")
     assert modal_app.is_garbage_text('p".')
-    assert modal_app.is_garbage_text(": manager. p\".")
     assert modal_app.is_garbage_text("*x $.")
     assert modal_app.is_garbage_text("+. I.")
     # Real content - should NOT be filtered
@@ -344,3 +343,14 @@ def test_cleanup_strips_trailing_punctuation_noise():
     text = modal_app.cleanup_extracted_text(raw_text)
 
     assert text == "Collaboration and Communication."
+
+
+def test_cleanup_strips_complex_trailing_noise():
+    assert modal_app.cleanup_extracted_text("manager. p\".") == "manager."
+    assert modal_app.cleanup_extracted_text("Associate.A!*1 ti:") == "Associate."
+
+
+def test_cleanup_strips_inline_noise():
+    raw = "Analytical and Problem-Solving Skills +. I. Analyze user requirements"
+    clean = modal_app.cleanup_extracted_text(raw)
+    assert clean == "Analytical and Problem-Solving Skills. Analyze user requirements"
