@@ -499,32 +499,40 @@ def is_garbage_text(text):
     if re.fullmatch(r"\d{1,2}\.", stripped):
         return False
 
+    # Strip all punctuation/symbols to see what real content remains
+    alpha_only = re.sub(r"[^a-zA-Z ]", "", stripped).strip()
+    alpha_chars = sum(1 for c in stripped if c.isalpha())
+    total_chars = len(stripped.replace(" ", ""))
+
     # Very short meaningless fragments (e.g. single punctuation or symbols)
-    if len(stripped) <= 2 and not stripped[0].isalpha():
+    if len(stripped) <= 3 and alpha_chars <= 1:
         return True
 
     # Strings that are mostly non-alphabetic characters
-    alpha_chars = sum(1 for c in stripped if c.isalpha())
-    total_chars = len(stripped.replace(" ", ""))
-    if total_chars >= 4 and alpha_chars / max(total_chars, 1) < 0.5:
+    if total_chars >= 4 and alpha_chars / max(total_chars, 1) < 0.45:
         return True
 
     # Short-word soup: many very short tokens that don't form a sentence
-    # e.g. "omo 5 n solo y" — mostly 1-2 char tokens
+    # e.g. "omo 5 n solo y", "*x $.", "+. I."
     tokens = stripped.split()
     if len(tokens) >= 3:
         short_tokens = sum(1 for t in tokens if len(t) <= 2)
         if short_tokens / len(tokens) >= 0.6 and total_chars <= 20:
             return True
 
+    # Very short text where the alphabetic content is minimal or punctuation ratio is high
+    # e.g. "A!*1 ti:", "p\".", ": manager. p\"."
+    alpha_words = alpha_only.split()
+    if len(alpha_words) <= 2 and total_chars >= 3:
+        if alpha_chars <= 4 or alpha_chars / max(total_chars, 1) < 0.7:
+            return True
+
     # Short strings with unusual character density (mixed digits/letters/symbols)
     if len(tokens) <= 4 and total_chars >= 4:
-        # Check if most tokens look like gibberish (not dictionary-like)
         gibberish_count = 0
         for token in tokens:
             clean_token = re.sub(r"[^a-zA-Z]", "", token)
             if len(clean_token) >= 3:
-                # Check for unlikely letter patterns (too many consonant clusters)
                 vowels = sum(1 for c in clean_token.lower() if c in "aeiou")
                 if vowels / max(len(clean_token), 1) < 0.15:
                     gibberish_count += 1
@@ -547,6 +555,15 @@ def cleanup_extracted_text(text):
             cleaned_lines.append("")
             continue
 
+        # Strip leading OCR punctuation noise (！：., ,., etc.)
+        line = re.sub(r"^[^a-zA-Z0-9(\[]*(?=[a-zA-Z0-9(\[])", "", line)
+
+        # Strip trailing OCR punctuation noise (.. , *x $., p"., etc.)
+        # Keep valid sentence-ending punctuation but remove garbage after it
+        line = re.sub(r"(?<=[a-zA-Z.!?])\s+[^a-zA-Z0-9\s]{1,}\s*$", "", line)
+        line = re.sub(r'\s*["]+\s*$', "", line)  # trailing stray quotes
+        line = re.sub(r"\s*\.{2,}\s*$", ".", line)  # trailing multiple dots
+
         line = re.sub(r"^(\d+\.\s+)['`]\s*(?=[A-Z][a-z])", r"\1", line)
         line = re.sub(r"^['`]\s*(?=[A-Z][a-z])", "", line)
         line = re.sub(r"\s+([,.;:!?])", r"\1", line)
@@ -568,6 +585,13 @@ def cleanup_extracted_text(text):
 
         # Strip trailing garbage fragments (e.g. "... results. 01n9mm01002k:")
         line = re.sub(r"\s+[A-Za-z0-9]{6,}\s*[:;]\s*$", "", line)
+
+        # Strip trailing short garbage after sentence-ending period
+        # e.g. "...senior team members. *x $." → "...senior team members."
+        line = re.sub(r"(?<=[.!?])\s+\S{1,4}\s+\S{1,3}[.!?]?\s*$", "", line)
+
+        if not line.strip():
+            continue
 
         cleaned_lines.append(line)
 

@@ -289,12 +289,21 @@ def test_parse_tesseract_data_converts_word_boxes():
 
 
 def test_is_garbage_text_detects_random_strings():
+    # Definite garbage
     assert modal_app.is_garbage_text("01n9mm01002k:")
     assert modal_app.is_garbage_text("omo 5 n solo y")
+    assert modal_app.is_garbage_text("A!*1 ti:")
+    assert modal_app.is_garbage_text('p".')
+    assert modal_app.is_garbage_text(": manager. p\".")
+    assert modal_app.is_garbage_text("*x $.")
+    assert modal_app.is_garbage_text("+. I.")
+    # Real content - should NOT be filtered
     assert not modal_app.is_garbage_text("System Support: Help troubleshoot and resolve technical issues.")
     assert not modal_app.is_garbage_text("Broward Health")
     assert not modal_app.is_garbage_text("1. Coding and Development")
     assert not modal_app.is_garbage_text("manager.")
+    assert not modal_app.is_garbage_text("Associate")
+    assert not modal_app.is_garbage_text("2. System Support")
 
 
 def test_split_inline_numbered_items_splits_section_headers():
@@ -319,3 +328,19 @@ def test_cleanup_strips_trailing_garbage():
 
     assert "01n9mm01002k" not in text
     assert "testing results" in text.lower()
+
+
+def test_cleanup_strips_leading_punctuation_noise():
+    raw_text = "！：.Expectations by Staff Level"
+
+    text = modal_app.cleanup_extracted_text(raw_text)
+
+    assert text == "Expectations by Staff Level"
+
+
+def test_cleanup_strips_trailing_punctuation_noise():
+    raw_text = "Collaboration and Communication.."
+
+    text = modal_app.cleanup_extracted_text(raw_text)
+
+    assert text == "Collaboration and Communication."
