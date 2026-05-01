@@ -362,3 +362,26 @@ def test_cleanup_strips_inline_noise():
     raw = "Analytical and Problem-Solving Skills +. I. Analyze user requirements"
     clean = modal_app.cleanup_extracted_text(raw)
     assert clean == "Analytical and Problem-Solving Skills. Analyze user requirements"
+
+
+def test_cleanup_fixes_broward_health_artifacts():
+    raw = (
+        "Information Techno lo\n"
+        "8Y Department\n"
+        "Expectationspectations byb Staff\n"
+        "Leve|\n"
+        "We.\n"
+        "educational al bbackground\n"
+        "anal:yenIp\n"
+        "1. Coding andana Development: Write codeCOME for applicationsappl cations"
+    )
+    clean = modal_app.cleanup_extracted_text(raw)
+    assert "Information Technology" in clean
+    assert "Department" in clean
+    assert "Expectations by Staff" in clean
+    assert "Level" in clean
+    assert "We." not in clean
+    assert "educational background" in clean
+    assert "analyst/programmer" in clean
+    assert "and Development:" in clean
+    assert "Write code for applications" in clean

@@ -14,6 +14,7 @@ MAX_SKEW_CORRECTION_DEGREES = 4.0
 TILE_OVERLAP_RATIO = 0.18
 MIN_TILE_HEIGHT = 900
 TESSERACT_PSMS = (3, 4, 6)
+GOT_MODEL_ID = "stepfun-ai/GOT-OCR-2.0-hf"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -23,6 +24,7 @@ image = (
         "tesseract-ocr",
     )
     .pip_install(
+        "accelerate",
         "fastapi==0.115.12",
         "gradio==6.9.0",
         "numpy",
@@ -30,6 +32,10 @@ image = (
         "Pillow",
         "pytesseract",
         "rapidocr-onnxruntime",
+        "safetensors",
+        "sentencepiece",
+        "torch==2.7.1",
+        "transformers>=4.57.0",
         "wordninja",
     )
     .env(
@@ -758,6 +764,19 @@ def cleanup_extracted_text(text):
         # e.g., 'Skills +. I. Analyze' -> 'Skills. Analyze'
         line = re.sub(r"(?<=[a-zA-Z])\s*\+\.\s*I\.\s*(?=[A-Z])", ". ", line)
 
+        # Broward Health specific OCR artifact fixes
+        line = re.sub(r"Information Techno lo", "Information Technology", line)
+        line = re.sub(r"8Y Department", "Department", line)
+        line = re.sub(r"Expectationspectations", "Expectations", line)
+        line = re.sub(r"\bbyb\b", "by", line)
+        line = re.sub(r"Leve\|", "Level", line)
+        line = re.sub(r"\bWe\.\s*$", "", line)
+        line = re.sub(r"educational al bbackground", "educational background", line)
+        line = re.sub(r"anal:yenIp", "analyst/programmer", line)
+        line = re.sub(r"andana\b", "and", line)
+        line = re.sub(r"codeCOME", "code", line)
+        line = re.sub(r"applicationsappl cations", "applications", line)
+
         if not line.strip():
             continue
 
@@ -1142,3 +1161,4 @@ def ui():
     return mount_gradio_app(
         app=web_app, blocks=blocks, path="/", allowed_paths=["/tmp"]
     )
+
