@@ -270,6 +270,14 @@ def test_build_tiled_ocr_inputs_for_tall_pages():
     assert all(item["group"] == "grayscale_tiles" for item in tiled)
 
 
+def test_order_corner_points_returns_tl_tr_br_bl():
+    points = [(300, 50), (40, 60), (20, 400), (320, 420)]
+
+    ordered = modal_app.order_corner_points(points).tolist()
+
+    assert ordered == [[40.0, 60.0], [300.0, 50.0], [320.0, 420.0], [20.0, 400.0]]
+
+
 def test_parse_tesseract_data_converts_word_boxes():
     data = {
         "text": ["Broward", "", "Health"],

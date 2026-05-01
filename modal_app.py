@@ -190,6 +190,135 @@ def normalize_image(image):
     return build_ocr_variants(image)[0]["image"]
 
 
+def order_corner_points(points):
+    import numpy as np
+
+    pts = np.array(points, dtype="float32")
+    sums = pts.sum(axis=1)
+    diffs = np.diff(pts, axis=1)
+    ordered = np.zeros((4, 2), dtype="float32")
+    ordered[0] = pts[sums.argmin()]
+    ordered[2] = pts[sums.argmax()]
+    ordered[1] = pts[diffs.argmin()]
+    ordered[3] = pts[diffs.argmax()]
+    return ordered
+
+
+def detect_document_corners(image):
+    import cv2
+    import numpy as np
+
+    image_array = np.array(image.convert("RGB"))
+    gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    edges = cv2.dilate(edges, None, iterations=2)
+    edges = cv2.erode(edges, None, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    image_area = image_array.shape[0] * image_array.shape[1]
+    candidates = []
+    for contour in contours:
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        area = cv2.contourArea(approx)
+        if len(approx) == 4 and area > image_area * 0.2:
+            candidates.append((area, approx.reshape(4, 2)))
+
+    if candidates:
+        return order_corner_points(max(candidates, key=lambda item: item[0])[1])
+
+    height, width = image_array.shape[:2]
+    return order_corner_points([(0, 0), (width - 1, 0), (width - 1, height - 1), (0, height - 1)])
+
+
+def warp_document(image, corners):
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    image_array = np.array(image.convert("RGB"))
+    rect = order_corner_points(corners)
+    (tl, tr, br, bl) = rect
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_width = max(int(width_a), int(width_b), 1)
+    max_height = max(int(height_a), int(height_b), 1)
+
+    destination = np.array(
+        [
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1],
+        ],
+        dtype="float32",
+    )
+
+    matrix = cv2.getPerspectiveTransform(rect, destination)
+    warped = cv2.warpPerspective(image_array, matrix, (max_width, max_height))
+    return Image.fromarray(warped)
+
+
+def build_scanned_document(image):
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    resized = resize_image_for_ocr(image)
+    corners = detect_document_corners(resized)
+    warped = warp_document(resized, corners).convert("L")
+    base = np.array(warped)
+
+    background = cv2.GaussianBlur(base, (0, 0), 35)
+    flattened = cv2.divide(base, background, scale=255)
+    flattened = cv2.normalize(flattened, None, 0, 255, cv2.NORM_MINMAX)
+    thresholded = cv2.adaptiveThreshold(
+        flattened,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        41,
+        15,
+    )
+
+    preview = Image.fromarray(flattened).convert("RGB")
+    binary = Image.fromarray(thresholded).convert("RGB")
+    return {"preview": preview, "binary": binary}
+
+
+def build_scanned_ocr_candidates(image):
+    scanned = build_scanned_document(image)
+    preview = scanned["preview"]
+    binary = scanned["binary"]
+
+    candidates = []
+    for name, candidate_image in (("scan_preview", preview), ("scan_binary", binary)):
+        result = run_tesseract(candidate_image)
+        candidates.append(
+            {
+                "name": name,
+                "image": preview,
+                "result": result,
+                "text": extract_text(result),
+            }
+        )
+        for psm in TESSERACT_PSMS:
+            raw_text = run_tesseract_text(candidate_image, psm)
+            candidates.append(
+                {
+                    "name": f"{name}:psm{psm}",
+                    "image": preview,
+                    "result": [],
+                    "text": cleanup_extracted_text(raw_text),
+                }
+            )
+    return candidates
+
+
 _rapidocr_engine = None
 
 
@@ -951,7 +1080,7 @@ def choose_best_ocr_candidate(candidates):
     max_containers=1,
     scaledown_window=600,
 )
-@modal.asgi_app(label="surya-ocr")
+@modal.asgi_app(label="scan-ocr")
 def ui():
     import gradio as gr
     from fastapi import FastAPI
@@ -959,48 +1088,25 @@ def ui():
 
     web_app = FastAPI()
 
-    def process_document(image, engine):
+    def process_document(image):
         if image is None:
-            return "Please upload an image."
+            return None, "Please upload an image."
 
-        if engine == "RapidOCR":
-            candidates = build_rapidocr_candidates(image)
-            best_candidate = choose_best_ocr_candidate(candidates)
-            if best_candidate and best_candidate["text"]:
-                return best_candidate["text"]
-
-        text_candidates = build_tesseract_text_candidates(image)
-        raw_candidates = []
-        for ocr_input in build_ocr_inputs(image):
-            raw_candidates.append(
-                {
-                    "name": f"tesseract:{ocr_input['name']}",
-                    "group": f"tesseract:{ocr_input['group']}",
-                    "result": offset_ocr_result(
-                        run_tesseract(ocr_input["image"]),
-                        offset_x=ocr_input["offset_x"],
-                        offset_y=ocr_input["offset_y"],
-                    ),
-                }
-            )
-
-        candidates = text_candidates + group_ocr_candidates(raw_candidates)
+        candidates = build_scanned_ocr_candidates(image)
         best_candidate = choose_best_ocr_candidate(candidates)
-        return best_candidate["text"] if best_candidate and best_candidate["text"] else "No text detected."
+        if not best_candidate:
+            return None, "No text detected."
+        return best_candidate.get("image"), best_candidate.get("text") or "No text detected."
 
     blocks = gr.Interface(
         fn=process_document,
-        inputs=[
-            gr.Image(type="pil", label="Upload scanned page / receipt / document"),
-            gr.Radio(
-                choices=["RapidOCR", "Tesseract"],
-                value="RapidOCR",
-                label="Engine",
-            ),
+        inputs=gr.Image(type="pil", label="Upload scanned page / receipt / document"),
+        outputs=[
+            gr.Image(type="pil", label="Scanned preview"),
+            gr.Textbox(label="Extracted text", lines=24),
         ],
-        outputs=gr.Textbox(label="Extracted text", lines=24),
-        title="Fast Document OCR",
-        description="RapidOCR (ONNX) document OCR with Tesseract fallback.",
+        title="Document Scan OCR",
+        description="Phone-photo document cleanup followed by OCR.",
     )
     blocks.enable_queue = False
 
