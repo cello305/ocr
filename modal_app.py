@@ -276,8 +276,12 @@ def build_scanned_document(image):
     background = cv2.GaussianBlur(base, (0, 0), 35)
     flattened = cv2.divide(base, background, scale=255)
     flattened = cv2.normalize(flattened, None, 0, 255, cv2.NORM_MINMAX)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    detailed = clahe.apply(flattened)
+    softened = cv2.GaussianBlur(detailed, (0, 0), 1.0)
+    sharpened = cv2.addWeighted(detailed, 1.45, softened, -0.45, 0)
     thresholded = cv2.adaptiveThreshold(
-        flattened,
+        sharpened,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
@@ -286,29 +290,54 @@ def build_scanned_document(image):
     )
 
     preview = Image.fromarray(flattened).convert("RGB")
+    detail = Image.fromarray(sharpened).convert("RGB")
     binary = Image.fromarray(thresholded).convert("RGB")
-    return {"preview": preview, "binary": binary}
+    return {"preview": preview, "detail": detail, "binary": binary}
 
 
 def build_scanned_ocr_candidates(image):
     scanned = build_scanned_document(image)
     preview = scanned["preview"]
+    detail = scanned["detail"]
     binary = scanned["binary"]
 
-    candidates = []
-    for name, candidate_image in (("scan_preview", preview), ("scan_binary", binary)):
-        result = run_tesseract(candidate_image)
-        candidates.append(
+    raw_candidates = []
+    for name, candidate_image in (
+        ("scan_preview", preview),
+        ("scan_detail", detail),
+        ("scan_binary", binary),
+    ):
+        raw_candidates.append(
             {
                 "name": name,
+                "group": name,
                 "image": preview,
-                "result": result,
-                "text": extract_text(result),
+                "result": run_tesseract(candidate_image),
             }
         )
-        for psm in TESSERACT_PSMS:
+        for tile_input in build_tiled_ocr_inputs(candidate_image, name):
+            raw_candidates.append(
+                {
+                    "name": tile_input["name"],
+                    "group": name,
+                    "image": preview,
+                    "result": offset_ocr_result(
+                        run_tesseract(tile_input["image"]),
+                        offset_x=tile_input["offset_x"],
+                        offset_y=tile_input["offset_y"],
+                    ),
+                }
+            )
+
+    grouped_candidates = []
+    for candidate in group_ocr_candidates(raw_candidates):
+        grouped_candidates.append({**candidate, "image": preview})
+
+    text_candidates = []
+    for name, candidate_image in (("scan_preview", preview), ("scan_detail", detail)):
+        for psm in (4, 6):
             raw_text = run_tesseract_text(candidate_image, psm)
-            candidates.append(
+            text_candidates.append(
                 {
                     "name": f"{name}:psm{psm}",
                     "image": preview,
@@ -316,7 +345,7 @@ def build_scanned_ocr_candidates(image):
                     "text": cleanup_extracted_text(raw_text),
                 }
             )
-    return candidates
+    return grouped_candidates + text_candidates
 
 
 _rapidocr_engine = None
