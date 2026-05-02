@@ -15,6 +15,7 @@ TILE_OVERLAP_RATIO = 0.18
 MIN_TILE_HEIGHT = 900
 TESSERACT_PSMS = (3, 4, 6)
 GOT_MODEL_ID = "stepfun-ai/GOT-OCR-2.0-hf"
+GOT_MAX_NEW_TOKENS = 1536
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -355,7 +356,7 @@ def run_got_ocr(images, multi_page=False, crop_to_patches=False, max_patches=4):
         do_sample=False,
         tokenizer=processor.tokenizer,
         stop_strings="<|im_end|>",
-        max_new_tokens=4096,
+        max_new_tokens=GOT_MAX_NEW_TOKENS,
     )
     prompt_len = inputs["input_ids"].shape[1]
     return processor.decode(
@@ -368,27 +369,18 @@ def build_got_candidates(image):
     scanned = build_scanned_document(image)
     preview = scanned["preview"]
     detail = scanned["detail"]
-    binary = scanned["binary"]
+    detail_pages = split_vertical_pages(detail, overlap_ratio=0.08)
 
-    candidates = []
-    for name, candidate_image in (
-        ("got_preview_full", preview),
-        ("got_detail_full", detail),
-        ("got_binary_full", binary),
-    ):
+    if len(detail_pages) == 1:
         text = cleanup_extracted_text(
-            run_got_ocr(candidate_image, multi_page=False, crop_to_patches=True, max_patches=4)
+            run_got_ocr(detail, multi_page=False, crop_to_patches=False)
         )
-        candidates.append({"name": name, "image": preview, "result": [], "text": text})
+        return [{"name": "got_detail_full", "image": preview, "result": [], "text": text}]
 
-    detail_pages = split_vertical_pages(detail, overlap_ratio=0.12)
     text = cleanup_extracted_text(
-        run_got_ocr(detail_pages, multi_page=True, crop_to_patches=False)
+        run_got_ocr(detail_pages, multi_page=True, crop_to_patches=False, max_patches=2)
     )
-    candidates.append(
-        {"name": "got_detail_pages", "image": preview, "result": [], "text": text}
-    )
-    return candidates
+    return [{"name": "got_detail_pages", "image": preview, "result": [], "text": text}]
 
 
 def build_scanned_ocr_candidates(image):
