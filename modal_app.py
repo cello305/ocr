@@ -373,14 +373,38 @@ def build_got_candidates(image):
 
     if len(detail_pages) == 1:
         text = cleanup_extracted_text(
-            run_got_ocr(detail, multi_page=False, crop_to_patches=False)
+            run_got_ocr(detail, multi_page=False, crop_to_patches=True, max_patches=2)
         )
         return [{"name": "got_detail_full", "image": preview, "result": [], "text": text}]
 
-    text = cleanup_extracted_text(
-        run_got_ocr(detail_pages, multi_page=True, crop_to_patches=False, max_patches=2)
-    )
+    page_texts = [
+        cleanup_extracted_text(
+            run_got_ocr(page, multi_page=False, crop_to_patches=True, max_patches=2)
+        )
+        for page in detail_pages
+    ]
+    text = merge_got_page_texts(page_texts)
     return [{"name": "got_detail_pages", "image": preview, "result": [], "text": text}]
+
+
+def merge_got_page_texts(page_texts):
+    merged_lines = []
+    for raw_text in page_texts:
+        for line in cleanup_extracted_text(raw_text).splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if merged_lines and lines_look_duplicated(merged_lines[-1], stripped):
+                continue
+            merged_lines.append(stripped)
+
+    merged = []
+    for line in merged_lines:
+        if merged and lines_look_duplicated(merged[-1], line):
+            continue
+        merged.append(line)
+
+    return cleanup_extracted_text("\n".join(merged))
 
 
 def build_scanned_ocr_candidates(image):

@@ -401,3 +401,18 @@ def test_cleanup_fixes_broward_health_artifacts():
     assert "analyst/programmer" in clean
     assert "and Development:" in clean
     assert "Write code for applications" in clean
+
+
+def test_merge_got_page_texts_dedupes_overlap_lines():
+    page_texts = [
+        "Technical Responsibilities\n1. Coding and Development",
+        "1. Coding and Development\n2. System Support",
+    ]
+
+    merged = modal_app.merge_got_page_texts(page_texts)
+
+    assert merged == (
+        "Technical Responsibilities\n"
+        "1. Coding and Development\n"
+        "2. System Support"
+    )
