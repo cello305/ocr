@@ -3,7 +3,7 @@ import re
 import modal
 
 
-APP_NAME = "ocr-test-surya"
+APP_NAME = "ocr-test-got-ocr"
 CPU_THREADS = 2
 MAX_IMAGE_EDGE = 1800
 TARGET_MIN_IMAGE_EDGE = 1400
@@ -48,6 +48,8 @@ image = (
 )
 
 app = modal.App(APP_NAME)
+_got_processor = None
+_got_model = None
 
 
 def resize_image_for_ocr(image):
@@ -299,6 +301,94 @@ def build_scanned_document(image):
     detail = Image.fromarray(sharpened).convert("RGB")
     binary = Image.fromarray(thresholded).convert("RGB")
     return {"preview": preview, "detail": detail, "binary": binary}
+
+
+def split_vertical_pages(image, overlap_ratio=0.1):
+    width, height = image.size
+    if height < width * 1.1:
+        return [image]
+
+    overlap = int(height * overlap_ratio * 0.5)
+    midpoint = height // 2
+    top = image.crop((0, 0, width, min(midpoint + overlap, height)))
+    bottom = image.crop((0, max(midpoint - overlap, 0), width, height))
+    return [top, bottom]
+
+
+def get_got_backend():
+    global _got_model, _got_processor
+    if _got_model is not None and _got_processor is not None:
+        return _got_model, _got_processor
+
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+    _got_processor = AutoProcessor.from_pretrained(
+        GOT_MODEL_ID,
+        trust_remote_code=True,
+    )
+    _got_model = AutoModelForImageTextToText.from_pretrained(
+        GOT_MODEL_ID,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+    )
+    _got_model.to(device)
+    _got_model.eval()
+    return _got_model, _got_processor
+
+
+def run_got_ocr(images, multi_page=False, crop_to_patches=False, max_patches=4):
+    model, processor = get_got_backend()
+    inputs = processor(
+        images,
+        return_tensors="pt",
+        multi_page=multi_page,
+        crop_to_patches=crop_to_patches,
+        max_patches=max_patches,
+    )
+    inputs = inputs.to(model.device)
+    generate_ids = model.generate(
+        **inputs,
+        do_sample=False,
+        tokenizer=processor.tokenizer,
+        stop_strings="<|im_end|>",
+        max_new_tokens=4096,
+    )
+    prompt_len = inputs["input_ids"].shape[1]
+    return processor.decode(
+        generate_ids[0, prompt_len:],
+        skip_special_tokens=True,
+    )
+
+
+def build_got_candidates(image):
+    scanned = build_scanned_document(image)
+    preview = scanned["preview"]
+    detail = scanned["detail"]
+    binary = scanned["binary"]
+
+    candidates = []
+    for name, candidate_image in (
+        ("got_preview_full", preview),
+        ("got_detail_full", detail),
+        ("got_binary_full", binary),
+    ):
+        text = cleanup_extracted_text(
+            run_got_ocr(candidate_image, multi_page=False, crop_to_patches=True, max_patches=4)
+        )
+        candidates.append({"name": name, "image": preview, "result": [], "text": text})
+
+    detail_pages = split_vertical_pages(detail, overlap_ratio=0.12)
+    text = cleanup_extracted_text(
+        run_got_ocr(detail_pages, multi_page=True, crop_to_patches=False)
+    )
+    candidates.append(
+        {"name": "got_detail_pages", "image": preview, "result": [], "text": text}
+    )
+    return candidates
 
 
 def build_scanned_ocr_candidates(image):
@@ -1124,11 +1214,12 @@ def choose_best_ocr_candidate(candidates):
 @app.function(
     image=image,
     cpu=2,
-    memory=2048,
+    memory=16384,
+    gpu="T4",
     max_containers=1,
     scaledown_window=600,
 )
-@modal.asgi_app(label="scan-ocr")
+@modal.asgi_app(label="got-ocr")
 def ui():
     import gradio as gr
     from fastapi import FastAPI
@@ -1140,7 +1231,7 @@ def ui():
         if image is None:
             return None, "Please upload an image."
 
-        candidates = build_scanned_ocr_candidates(image)
+        candidates = build_got_candidates(image)
         best_candidate = choose_best_ocr_candidate(candidates)
         if not best_candidate:
             return None, "No text detected."
@@ -1153,8 +1244,8 @@ def ui():
             gr.Image(type="pil", label="Scanned preview"),
             gr.Textbox(label="Extracted text", lines=24),
         ],
-        title="Document Scan OCR",
-        description="Phone-photo document cleanup followed by OCR.",
+        title="Fast Document OCR - GOT-OCR 2.0",
+        description="Document-focused OCR for scanned pages and phone photos on Modal.",
     )
     blocks.enable_queue = False
 
@@ -1162,3 +1253,28 @@ def ui():
         app=web_app, blocks=blocks, path="/", allowed_paths=["/tmp"]
     )
 
+
+@app.function(image=image, cpu=2, memory=16384, gpu="T4")
+def debug_process_document(img_bytes):
+    from PIL import Image
+    import io
+    image = Image.open(io.BytesIO(img_bytes))
+    candidates = build_got_candidates(image)
+    out = ""
+    for c in candidates:
+        score = score_ocr_candidate(c.get("text", ""), c.get("result") or [])
+        out += f"\n=== CANDIDATE: {c['name']} (Score: {score}) ===\n"
+        out += c.get("text", "")[:300] + "\n"
+        out += "-" * 40 + "\n"
+    return out
+
+
+@app.local_entrypoint()
+def test_run():
+    import pathlib
+    image_path = pathlib.Path(r'C:\Users\Emanuel\.gemini\antigravity\brain\30722683-1abe-4d2d-a304-b887febb0a4e\media__1777604538728.png')
+    with open(image_path, 'rb') as f:
+        img_bytes = f.read()
+    
+    output = debug_process_document.remote(img_bytes)
+    print(output)

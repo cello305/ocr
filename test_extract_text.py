@@ -25,6 +25,12 @@ class _FakeApp:
 
         return decorator
 
+    def local_entrypoint(self, *args, **kwargs):
+        def decorator(fn):
+            return fn
+
+        return decorator
+
 
 def _load_modal_app():
     fake_modal = types.SimpleNamespace(
@@ -276,6 +282,16 @@ def test_order_corner_points_returns_tl_tr_br_bl():
     ordered = modal_app.order_corner_points(points).tolist()
 
     assert ordered == [[40.0, 60.0], [300.0, 50.0], [320.0, 420.0], [20.0, 400.0]]
+
+
+def test_split_vertical_pages_splits_tall_images_with_overlap():
+    image = _FakeImage(1000, 2400)
+
+    pages = modal_app.split_vertical_pages(image, overlap_ratio=0.12)
+
+    assert len(pages) == 2
+    assert pages[0].size == (1000, 1344)
+    assert pages[1].size == (1000, 1344)
 
 
 def test_parse_tesseract_data_converts_word_boxes():
