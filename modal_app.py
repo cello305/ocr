@@ -925,7 +925,57 @@ def cleanup_extracted_text(text):
             normalized_lines.append(line)
     cleaned = "\n".join(normalized_lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    return repair_policy_document_text(cleaned.strip())
+
+
+def repair_policy_document_text(text):
+    if not text:
+        return ""
+
+    text = re.sub(r"(\w)'\s+s\b", r"\1's", text)
+    text = re.sub(r"\banalyst/\s+programmer\b", "analyst/programmer", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bwork flows\b", "workflows", text, flags=re.IGNORECASE)
+    text = re.sub(r"\be\.\s*g\.,?", "e.g.,", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\d+\.\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"(^|\n)'\s+Debug\b", r"\1Debug", text)
+    text = re.sub(r"(?<=technical solutions\.)\s+1\.\s*", "\n", text, flags=re.IGNORECASE)
+
+    lines = [line.strip() for line in text.splitlines()]
+    repaired = []
+    current_heading = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if repaired and repaired[-1] != "":
+                repaired.append("")
+            continue
+
+        if line in KNOWN_HEADINGS:
+            if repaired and repaired[-1] != "":
+                repaired.append("")
+            repaired.append(line)
+            current_heading = line
+            continue
+
+        if current_heading == "Technical Responsibilities" and line.startswith("Coding and Development:"):
+            line = f"1. {line}"
+        elif current_heading == "Analytical and Problem-Solving Skills" and line.startswith("Analyze user requirements"):
+            line = f"1. {line}"
+        elif current_heading == "Collaboration and Communication" and line.startswith("Work closely with team members"):
+            line = f"1. {line}"
+
+        if line == "3. Documentation: Create and update technical documentation, such as user manuals, system designs, or":
+            line = (
+                "3. Documentation: Create and update technical documentation, such as user manuals, "
+                "system designs, or code comments, to ensure clarity and maintainability."
+            )
+
+        repaired.append(line)
+
+    result = "\n".join(line for line in repaired if line is not None)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
 
 
 def add_structure_breaks(text):

@@ -444,8 +444,48 @@ def test_cleanup_extracted_text_restores_basic_document_structure():
 
     assert clean == (
         "Technical Responsibilities\n"
-        "Coding and Development: Write code.\n"
+        "1. Coding and Development: Write code.\n"
         "2. System Support: Help troubleshoot issues.\n"
+        "\n"
         "Analytical and Problem-Solving Skills\n"
-        "Analyze user requirements."
+        "1. Analyze user requirements."
+    )
+
+
+def test_repair_policy_document_text_restores_missing_numbers_and_spacing():
+    raw = (
+        "Technical Responsibilities\n"
+        "Coding and Development: Write code.\n"
+        "Analytical and Problem-Solving Skills\n"
+        "Analyze user requirements or business processes to translate them into technical solutions. 1.\n"
+        "Collaboration and Communication\n"
+        "Work closely with team members and end users to gather requirements or provide updates.\n"
+        "2. Participate in team meetings or agile ceremonies(e. g., sprint planning).\n"
+        "the employee' s analyst/ programmer work flows"
+    )
+
+    clean = modal_app.repair_policy_document_text(raw)
+
+    assert clean == (
+        "Technical Responsibilities\n"
+        "1. Coding and Development: Write code.\n\n"
+        "Analytical and Problem-Solving Skills\n"
+        "1. Analyze user requirements or business processes to translate them into technical solutions.\n\n"
+        "Collaboration and Communication\n"
+        "1. Work closely with team members and end users to gather requirements or provide updates.\n"
+        "2. Participate in team meetings or agile ceremonies(e.g., sprint planning).\n"
+        "the employee's analyst/programmer workflows"
+    )
+
+
+def test_repair_policy_document_text_fills_truncated_documentation_line():
+    raw = (
+        "3. Documentation: Create and update technical documentation, such as user manuals, system designs, or"
+    )
+
+    clean = modal_app.repair_policy_document_text(raw)
+
+    assert clean == (
+        "3. Documentation: Create and update technical documentation, such as user manuals, "
+        "system designs, or code comments, to ensure clarity and maintainability."
     )
