@@ -416,3 +416,36 @@ def test_merge_got_page_texts_dedupes_overlap_lines():
         "1. Coding and Development\n"
         "2. System Support"
     )
+
+
+def test_find_line_overlap_detects_duplicate_prefix_block():
+    left = [
+        "1. Coding and Development: Write code.",
+        "2. System Support: Help troubleshoot issues.",
+    ]
+    right = [
+        "2. System Support: Help troubleshoot issues.",
+        "3. Documentation: Create and update technical documentation.",
+    ]
+
+    overlap = modal_app.find_line_overlap(left, right)
+
+    assert overlap == 1
+
+
+def test_cleanup_extracted_text_restores_basic_document_structure():
+    raw = (
+        "Technical Responsibilities Coding and Development: Write code. "
+        "2. System Support: Help troubleshoot issues. "
+        "Analytical and Problem-Solving Skills Analyze user requirements."
+    )
+
+    clean = modal_app.cleanup_extracted_text(raw)
+
+    assert clean == (
+        "Technical Responsibilities\n"
+        "Coding and Development: Write code.\n"
+        "2. System Support: Help troubleshoot issues.\n"
+        "Analytical and Problem-Solving Skills\n"
+        "Analyze user requirements."
+    )

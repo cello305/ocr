@@ -16,6 +16,12 @@ MIN_TILE_HEIGHT = 900
 TESSERACT_PSMS = (3, 4, 6)
 GOT_MODEL_ID = "stepfun-ai/GOT-OCR-2.0-hf"
 GOT_MAX_NEW_TOKENS = 1536
+KNOWN_HEADINGS = (
+    "Epic Team Staff Levels",
+    "Technical Responsibilities",
+    "Analytical and Problem-Solving Skills",
+    "Collaboration and Communication",
+)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -388,23 +394,33 @@ def build_got_candidates(image):
 
 
 def merge_got_page_texts(page_texts):
-    merged_lines = []
-    for raw_text in page_texts:
-        for line in cleanup_extracted_text(raw_text).splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if merged_lines and lines_look_duplicated(merged_lines[-1], stripped):
-                continue
-            merged_lines.append(stripped)
+    processed_pages = [
+        [line.strip() for line in cleanup_extracted_text(raw_text).splitlines() if line.strip()]
+        for raw_text in page_texts
+    ]
+    processed_pages = [lines for lines in processed_pages if lines]
+    if not processed_pages:
+        return ""
 
-    merged = []
-    for line in merged_lines:
-        if merged and lines_look_duplicated(merged[-1], line):
-            continue
-        merged.append(line)
+    merged = list(processed_pages[0])
+    for lines in processed_pages[1:]:
+        overlap = find_line_overlap(merged, lines)
+        for line in lines[overlap:]:
+            if any(lines_look_duplicated(existing, line) for existing in merged[-6:]):
+                continue
+            merged.append(line)
 
     return cleanup_extracted_text("\n".join(merged))
+
+
+def find_line_overlap(left_lines, right_lines):
+    max_overlap = min(len(left_lines), len(right_lines), 8)
+    for size in range(max_overlap, 0, -1):
+        left_slice = left_lines[-size:]
+        right_slice = right_lines[:size]
+        if all(lines_look_duplicated(left, right) for left, right in zip(left_slice, right_slice)):
+            return size
+    return 0
 
 
 def build_scanned_ocr_candidates(image):
@@ -889,6 +905,7 @@ def cleanup_extracted_text(text):
         cleaned_lines.append(line)
 
     cleaned = "\n".join(cleaned_lines)
+    cleaned = add_structure_breaks(cleaned)
     cleaned = re.sub(r"(?<=\d)\.(?=[A-Z])", ". ", cleaned)
     cleaned = re.sub(r"(?<=\S)\s+(?=\d{1,2}\.\s*[A-Z])", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -909,6 +926,49 @@ def cleanup_extracted_text(text):
     cleaned = "\n".join(normalized_lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def add_structure_breaks(text):
+    if not text:
+        return ""
+
+    structured = text
+    for heading in KNOWN_HEADINGS:
+        structured = re.sub(
+            rf"(?<!^)(?<!\n)\s*({re.escape(heading)})\b",
+            r"\n\1",
+            structured,
+        )
+
+    structured = re.sub(r"(Effective June \d{1,2},\s*\d{4})\s+(?=Epic Team Staff Levels)", r"\1\n", structured)
+    structured = re.sub(r"(Epic Team Staff Levels)\s+(?=Associate\b)", r"\1\n\n", structured)
+    structured = re.sub(
+        r"(Associate)\s+(?=An associate-level employee\b)",
+        r"\1\n",
+        structured,
+    )
+    structured = re.sub(
+        r"(Technical Responsibilities)\s+(?=(?:\d+\.\s+)?[A-Z][a-z]+ and [A-Z][a-z]+:)",
+        r"\1\n",
+        structured,
+    )
+    structured = re.sub(
+        r"(Analytical and Problem-Solving Skills)\s+(?=(?:\d+\.\s+)?Analyze\b)",
+        r"\1\n",
+        structured,
+    )
+    structured = re.sub(
+        r"(Collaboration and Communication)\s+(?=\d+\.\s+[A-Z])",
+        r"\1\n",
+        structured,
+    )
+    structured = re.sub(
+        r"(?<=[a-z])\s+(?=(?:\d+\.\s+)?[A-Z][a-z]+ and [A-Z][a-z]+:)",
+        "\n",
+        structured,
+    )
+    structured = re.sub(r"\s+(?=\d+\.\s+[A-Z])", "\n", structured)
+    return structured
 
 
 def split_inline_numbered_items(line):
