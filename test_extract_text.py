@@ -473,8 +473,22 @@ def test_repair_policy_document_text_restores_missing_numbers_and_spacing():
         "1. Analyze user requirements or business processes to translate them into technical solutions.\n\n"
         "Collaboration and Communication\n"
         "1. Work closely with team members and end users to gather requirements or provide updates.\n"
-        "2. Participate in team meetings or agile ceremonies(e.g., sprint planning).\n"
+        "2. Participate in team meetings or agile ceremonies (e.g., sprint planning).\n"
         "the employee's analyst/programmer workflows"
+    )
+
+
+def test_repair_policy_document_text_splits_inline_numbered_items_and_stray_quotes():
+    raw = (
+        "2. Identify inefficiencies in systems or workflows and propose basic improvements. "
+        "3. ' Debug issues methodically, often collaborating with senior team members."
+    )
+
+    clean = modal_app.repair_policy_document_text(raw)
+
+    assert clean == (
+        "2. Identify inefficiencies in systems or workflows and propose basic improvements.\n"
+        "3. Debug issues methodically, often collaborating with senior team members."
     )
 
 

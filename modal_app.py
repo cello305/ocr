@@ -936,8 +936,11 @@ def repair_policy_document_text(text):
     text = re.sub(r"\banalyst/\s+programmer\b", "analyst/programmer", text, flags=re.IGNORECASE)
     text = re.sub(r"\bwork flows\b", "workflows", text, flags=re.IGNORECASE)
     text = re.sub(r"\be\.\s*g\.,?", "e.g.,", text, flags=re.IGNORECASE)
+    text = re.sub(r"([A-Za-z])\(", r"\1 (", text)
     text = re.sub(r"^\d+\.\s*$", "", text, flags=re.MULTILINE)
     text = re.sub(r"(^|\n)'\s+Debug\b", r"\1Debug", text)
+    text = re.sub(r"(?<=\.)\s+(?=\d+\.\s*['`\"]?\s*[A-Z])", "\n", text)
+    text = re.sub(r"(^|\n)(\d+\.)\s*['`\"]+\s*(?=[A-Z])", r"\1\2 ", text)
     text = re.sub(r"(?<=technical solutions\.)\s+1\.\s*", "\n", text, flags=re.IGNORECASE)
 
     lines = [line.strip() for line in text.splitlines()]
